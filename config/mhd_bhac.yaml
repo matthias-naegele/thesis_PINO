@@ -1,0 +1,209 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Modifications copyright (c) 2026 Matthias Nägele.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+## Training options
+load_ckpt: True
+use_wandb: True
+output_dir: /path/to/FNO_output
+
+###################
+## Model options
+model_params:
+  layers: 48
+  modes: [10, 24, 24]
+  num_fno_layers: 4
+  fc_dim: 128
+  decoder_layers: 1
+  in_dim: 11 # 3 + in_fields
+  out_dim: 7
+  dimension: 3
+  activation: 'gelu'
+  pad_x: 0
+  pad_y: 0
+  pad_z: 5
+
+  input_norm: [
+    10.0,
+    6.270909786224365,
+    6.270909786224365,
+    1.009229241893173,
+    1.1580078196379973,
+    1.8550656856940995,
+    1.5237639564209606,
+    2.59764252411111,
+    1.608931561912946,
+    1.0,
+    3.841360012302175e-04
+  ]
+  output_norm: [
+    1, # 1205.9536538736907,
+    1, # 1830.9032530028053,
+    1, # 1805.956401608314,
+    1, # 2061.042622180051,
+    1, # 1637.037707764793,
+    1, # 1724.774650691096,
+    1, # 1109.335930897566
+  ]
+
+
+###################
+## Dataset options
+dataset_params:
+  data_dir: /path/to/BHAC_output/orszagTang
+  output_names: 'output-????'
+  file_name: 'fno_uniform_level1.h5'
+  num_train: 23
+  num_test: 6
+  sub_x: 1
+  sub_t: 1
+  ind_x: null
+  # take time steps of the front
+  # sets the first used index
+  ind_t_start: 0 # 235
+  # take time steps of the end
+  # set null if unused
+  # sets the last non-used index
+  ind_t: 101
+  fields: ['u1','u2','b1','b2','p','e3','rho']
+
+###################
+## Dataloader options
+train_loader_params:
+  batch_size: 1
+  shuffle: True
+  num_workers: 20
+  pin_memory: True
+
+val_loader_params:
+  batch_size: 1
+  shuffle: False
+  num_workers: 20
+  pin_memory: True
+
+test_loader_params:
+  batch_size: 1
+  shuffle: False
+  num_workers: 20
+  pin_memory: True
+
+###################
+## Loss options
+loss_params:
+  # Adiabatic index for the ideal-MHD equation of state (4/3 for a
+  # relativistic-electron plasma; use 5/3 for non-relativistic).
+  Gamma: 1.3333333333333333
+
+  data_weight: 1
+  pde_weight: 0.00
+  constraint_weight: 0
+
+  pde_weight_ramp_epoch: 1            # increase pde_weight every N epochs
+  pde_weight_ramp_increment: 0.00013
+  constraint_weight_ramp_epoch: 1
+  constraint_weight_ramp_increment: 0.00013
+
+  # Data-weight decay (per-epoch): data_weight -= decrement every N epochs,
+  # floored at data_weight_floor. Default 0 = off, preserves existing runs.
+  data_weight_ramp_epoch: 1
+  data_weight_ramp_decrement: 0.00041
+  data_weight_floor: 0.0
+
+  use_data_loss: True
+  use_pde_loss: True
+  use_constraint_loss: True
+
+  u1_weight: 1.0
+  u2_weight: 1.0
+  b1_weight: 1.0
+  b2_weight: 1.0
+  p_weight: 1.0
+  e3_weight: 1.0
+  rho_weight: 1.0
+
+  # PDE weight
+  # weight among different PDEs 
+  FI1_weight: 10
+  FI2_weight: 10
+  MO_weight: 1000
+  ES0_weight: 0.0001
+  ES1_weight: 0.0001
+  ES2_weight: 0.0001
+  C1_weight: 1
+
+  div_B_weight: 1
+
+  Lx: 6.283185307 # physical scale of the simulation (2*pi)
+  Ly: 6.283185307
+
+  # Auto-derived at runtime from the dataloader's real time axis.
+  tend: null
+
+  # relative weighting within on class
+  use_weighted_mean: False
+
+  # stride for data loss timesteps (2 = every second timestep, 1 = off)
+  data_loss_stride: 1
+
+  # Spatial downsampling factor for the ENFORCED data loss (1 = off).
+  # When >1, the enforced data loss is computed on a strided-subsampled
+  # (coarse) version of pred/true — matching the dataloader's `sub_x`
+  # semantics. The full-resolution data loss is still logged as
+  # `loss_data_highres` (non-skipped timesteps) and `loss_data_skipped`
+  # (skipped timesteps) for evaluation without affecting gradients.
+  data_loss_coarse_factor: 8
+
+  # stride for physics loss timesteps (PDE + divB, 1 = off)
+  physics_loss_stride: 1
+
+  # diff type
+  diff_type: 'fourier'
+
+###################
+## Optimizer options
+optimizer_params:
+  betas: [0.9, 0.999]
+  lr: 0.003 # 0.001
+  milestones: [25, 50, 75, 100, 125, 150]
+  gamma: 0.5
+  weight_decay: 0.1
+
+
+###################
+## Train params
+train_params:
+  epochs: 1000
+  ckpt_freq: 100
+  ckpt_path: /path/to/FNO_output/checkpoints
+
+###################
+## wandb params
+wandb_params:
+  wandb_dir: /path/to/FNO_output/wandb/
+  wandb_project: 'MHD_PINO'
+  wandb_group: 'MHD_Re250'
+  wandb_num_plots: 0
+  wandb_plot_freq: 3500
+  wandb_plot_types: ['ic', 'pred', 'true', 'error']
+  wandb_mode: online
+  wandb_entity: '<your-wandb-entity-here>'
+  # this index starts at t_ind_start
+  wandb_plot_index_t: 96
+
+test:
+  batchsize: 1
+  ckpt_path: 'checkpoints/MHD/MHD_PINO_Re250/'

@@ -1,0 +1,28 @@
+MHD PINO
+Copyright (c) 2026 Matthias Nägele
+
+This product includes software originally developed by
+NVIDIA CORPORATION & AFFILIATES as part of NVIDIA PhysicsNeMo
+(https://github.com/NVIDIA/physicsnemo), licensed under the
+Apache License, Version 2.0.
+
+Files derived from or substantially based on PhysicsNeMo include
+(but are not limited to):
+
+  - train_bhac.py
+  - config/mhd_bhac.yaml
+  - dataloaders/__init__.py
+  - dataloaders/dataloaders.py
+  - dataloaders/datasets.py
+  - losses/__init__.py
+  - losses/losses.py
+  - losses/loss_mhd_physicsnemo.py
+  - losses/mhd_pde.py
+  - losses/fourier_derivatives.py
+  - utils/plot_utils.py
+
+The NVIDIA copyright notices have been retained in each affected file
+in accordance with Section 4(c) of the Apache License, Version 2.0.
+
+Modifications are copyright (c) 2026 Matthias Nägele and are
+distributed under the same Apache License, Version 2.0.
