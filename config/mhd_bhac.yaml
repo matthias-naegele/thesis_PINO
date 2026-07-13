@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modifications copyright (c) 2026 Matthias Nägele.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -15,11 +14,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ============================================================================
+# STALE / NON-REPRESENTATIVE DEFAULT — read this before using.
+#
+# This is the historical `config_name="mhd_bhac.yaml"` default that the Hydra
+# entry points (train_bhac.py, plot_index.py, plot_B2_onValidation.py, the two
+# eval/ scripts) fall back to when no `--config-name` is given. It is NOT a
+# canonical run: it predates the `weight_schedule` refactor and was never part
+# of the reported results, so it may not even train cleanly as-is.
+#
+#   - The physics ramp here is the OLD flat `*_ramp_*` mechanism, now neutralized
+#     to 0 (pure data loss). The current runs bake their ramp into
+#     `loss_params.weight_schedule` — see any of the `config/*_t*.yaml` run
+#     configs for the real, reproducible setup.
+#   - Paths are derived from `config/paths.yaml` (like the run configs) instead
+#     of the old hard-coded /home/s436864 paths.
+#
+# Treat it only as a schema/keys reference and a harmless fallback; run real
+# experiments from the named run configs, not this file.
+# ============================================================================
+
+defaults:
+  - paths      # data_root / output_root live in config/paths.yaml (edit there)
+  - wandb      # wandb_entity / wandb_mode live in config/wandb.yaml (edit there)
+  - _self_
 
 ## Training options
 load_ckpt: True
 use_wandb: True
-output_dir: /path/to/FNO_output
+# Reproducibility: RNG seed for model init + data shuffle order.
+seed: 0
+output_dir: ${output_root}
+# derivative: 'physicsnemo' # use 'physicsnemo' or 'original' method to take derivatives
 
 ###################
 ## Model options
@@ -32,8 +58,7 @@ model_params:
   in_dim: 11 # 3 + in_fields
   out_dim: 7
   dimension: 3
-  activation: 'gelu'
-  pad_x: 0
+  pad_x: 0 # 5
   pad_y: 0
   pad_z: 5
 
@@ -64,7 +89,7 @@ model_params:
 ###################
 ## Dataset options
 dataset_params:
-  data_dir: /path/to/BHAC_output/orszagTang
+  data_dir: ${data_root}/finished
   output_names: 'output-????'
   file_name: 'fno_uniform_level1.h5'
   num_train: 23
@@ -95,35 +120,30 @@ val_loader_params:
   num_workers: 20
   pin_memory: True
 
-test_loader_params:
-  batch_size: 1
-  shuffle: False
-  num_workers: 20
-  pin_memory: True
-
 ###################
 ## Loss options
 loss_params:
-  # Adiabatic index for the ideal-MHD equation of state (4/3 for a
-  # relativistic-electron plasma; use 5/3 for non-relativistic).
-  Gamma: 1.3333333333333333
+  Gamma: 1.333333333333333333333333333333333333333333333333333333333333
 
   data_weight: 1
+  ic_weight: 0.0
   pde_weight: 0.00
   constraint_weight: 0
 
-  pde_weight_ramp_epoch: 1            # increase pde_weight every N epochs
-  pde_weight_ramp_increment: 0.00013
-  constraint_weight_ramp_epoch: 1
-  constraint_weight_ramp_increment: 0.00013
+  # Old flat ramp knobs, neutralized to 0 (this stale default trains pure data
+  # loss). Real runs use `loss_params.weight_schedule` instead — see the run
+  # configs.
+  pde_weight_ramp_epoch: 0
+  pde_weight_ramp_increment: 0.0
+  constraint_weight_ramp_epoch: 0
+  constraint_weight_ramp_increment: 0.0
 
-  # Data-weight decay (per-epoch): data_weight -= decrement every N epochs,
-  # floored at data_weight_floor. Default 0 = off, preserves existing runs.
-  data_weight_ramp_epoch: 1
-  data_weight_ramp_decrement: 0.00041
+  data_weight_ramp_epoch: 0
+  data_weight_ramp_decrement: 0.0
   data_weight_floor: 0.0
 
   use_data_loss: True
+  use_ic_loss: False  # ! unused, non-adjusted PhysicsNeMo carry-over (see ic_loss in loss_mhd_physicsnemo.py)
   use_pde_loss: True
   use_constraint_loss: True
 
@@ -145,13 +165,14 @@ loss_params:
   ES2_weight: 0.0001
   C1_weight: 1
 
-  div_B_weight: 1
+  # Constraint: use constraint_weight instead
+  div_B_weight: 1 # also useless for one constraint with weighted_mean
 
-  Lx: 6.283185307 # physical scale of the simulation (2*pi)
+  Lx: 6.283185307 # physical scale of the simulation
   Ly: 6.283185307
 
-  # Auto-derived at runtime from the dataloader's real time axis.
-  tend: null
+  # no meaning anymore but leave in
+  tend: 0.06484 # 10 # physical time of the simulation
 
   # relative weighting within on class
   use_weighted_mean: False
@@ -166,9 +187,6 @@ loss_params:
   # `loss_data_highres` (non-skipped timesteps) and `loss_data_skipped`
   # (skipped timesteps) for evaluation without affecting gradients.
   data_loss_coarse_factor: 8
-
-  # stride for physics loss timesteps (PDE + divB, 1 = off)
-  physics_loss_stride: 1
 
   # diff type
   diff_type: 'fourier'
@@ -188,22 +206,22 @@ optimizer_params:
 train_params:
   epochs: 1000
   ckpt_freq: 100
-  ckpt_path: /path/to/FNO_output/checkpoints
+  ckpt_path: ${output_root}/checkpoints/mhd_bhac
 
 ###################
 ## wandb params
 wandb_params:
-  wandb_dir: /path/to/FNO_output/wandb/
+  wandb_dir: ${output_root}/wandb
   wandb_project: 'MHD_PINO'
   wandb_group: 'MHD_Re250'
   wandb_num_plots: 0
+  # Deliberately set far above the run's epoch count: the in-training
+  # wandb prediction plots were not used, so this large period disables
+  # them (the plotting block only fires when epoch % wandb_plot_freq == 0).
   wandb_plot_freq: 3500
   wandb_plot_types: ['ic', 'pred', 'true', 'error']
-  wandb_mode: online
-  wandb_entity: '<your-wandb-entity-here>'
+  wandb_mode: ${wandb_mode}
+  wandb_entity: ${wandb_entity}
   # this index starts at t_ind_start
   wandb_plot_index_t: 96
 
-test:
-  batchsize: 1
-  ckpt_path: 'checkpoints/MHD/MHD_PINO_Re250/'

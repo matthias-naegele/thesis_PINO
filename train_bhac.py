@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modifications copyright (c) 2026 Matthias Nägele.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -17,10 +16,14 @@
 
 import hydra
 from omegaconf import DictConfig
+from math import ceil
+import random
+import numpy as np
 import torch
 import plotly
 import os
 
+from torch.optim import lr_scheduler
 from torch.nn.parallel import DistributedDataParallel
 from omegaconf import OmegaConf
 
@@ -46,16 +49,27 @@ torch.set_default_dtype(dtype)
 
 @hydra.main(version_base="1.3", config_path="config", config_name="mhd_bhac.yaml")
 def main(cfg: DictConfig) -> None:
-    """Train a Fourier Neural Operator on 2D MHD trajectories produced by BHAC.
+    """Train the BHAC-MHD Fourier Neural Operator.
 
-    The model is trained as a PINO: a supervised data loss on the FNO output is
-    combined with PDE-residual losses (ideal MHD: continuity, momentum, induction,
-    energy) and a soft divergence-free constraint on B. Configuration is fully
-    Hydra-driven via ``config/mhd_bhac.yaml``.
+    An FNO (PhysicsNeMo) is trained on 2D MHD data from BHAC with a combined
+    data + PDE-residual + divergence-B loss. The run is selected by Hydra
+    (`--config-name <config>`); the physics-loss ramp is driven declaratively by
+    the config's `loss_params.weight_schedule`. Distributed training runs under
+    `torchrun` (DDP via PhysicsNeMo's DistributedManager).
     """
 
     DistributedManager.initialize()  # Only call this once in the entire script!
     dist = DistributedManager()  # call if required elsewhere
+
+    # Reproducibility: seed the RNGs (model init + data shuffle order) from the
+    # config `seed` (default 0). DDP broadcasts rank-0 weights, so a single
+    # shared seed is enough; the global torch RNG also drives the dataloader
+    # shuffle. Set before the model is built.
+    seed = int(OmegaConf.select(cfg, "seed", default=0))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     # initialize monitoring
     log = PythonLogger(name="mhd_pino")
@@ -84,7 +98,6 @@ def main(cfg: DictConfig) -> None:
     dataset_params = cfg.dataset_params
     train_loader_params = cfg.train_loader_params
     val_loader_params = cfg.val_loader_params
-    test_loader_params = cfg.test_loader_params
     loss_params = cfg.loss_params
     optimizer_params = cfg.optimizer_params
     train_params = cfg.train_params
@@ -97,7 +110,6 @@ def main(cfg: DictConfig) -> None:
     output_dir = to_absolute_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    data_dir = dataset_params.data_dir
     ckpt_path = train_params.ckpt_path
 
     # Construct dataloaders
@@ -216,6 +228,12 @@ def main(cfg: DictConfig) -> None:
         loaded_epoch = load_checkpoint(
             ckpt_path, model, optimizer, scheduler, device=dist.device
         )
+        # The loss-weight ramp state is not part of the checkpoint, so replay
+        # the weight schedule up to the resumed epoch (no-op without a
+        # `weight_schedule`). This lets a single continuous run be interrupted
+        # and resumed with exactly the weights of an uninterrupted run.
+        if loaded_epoch > 0:
+            mhd_loss.restore_weight_state(loaded_epoch)
 
     # Training Loop
     epochs = train_params.epochs
@@ -223,6 +241,34 @@ def main(cfg: DictConfig) -> None:
     names = dataset_params.fields
     input_norm = torch.tensor(model_params.input_norm).to(dist.device)
     output_norm = torch.tensor(model_params.output_norm).to(dist.device)
+
+    # --- Memory instrumentation ---------------------------------------------
+    # We report per-phase peak GPU memory on the first few training steps so
+    # we can see how the activation budget splits across the FNO forward, loss,
+    # and backward phases — useful when sizing a run to fit a given resolution.
+    # Uses max_memory_allocated (allocator peak), which is the authoritative
+    # measure — nvidia-smi shows cached/reserved and will not drop when
+    # activations are freed.
+    DEBUG_MEMORY_STEPS = int(os.environ.get("DEBUG_MEMORY_STEPS", "3"))
+
+    def _mem_gb() -> float:
+        if not torch.cuda.is_available():
+            return 0.0
+        return torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+    def _mem_reset() -> None:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _mem_report(tag: str, rank: int) -> None:
+        if not torch.cuda.is_available():
+            return
+        if rank != 0:
+            return
+        peak = _mem_gb()
+        cur = torch.cuda.memory_allocated() / (1024 ** 3)
+        print(f"[memory] {tag}: peak={peak:.2f} GB, current={cur:.2f} GB", flush=True)
+    # ------------------------------------------------------------------------
 
     for epoch in range(max(1, loaded_epoch + 1), epochs + 1):
         with LaunchLogger(
@@ -238,18 +284,40 @@ def main(cfg: DictConfig) -> None:
             model.train()
 
             for i, (inputs, outputs) in enumerate(dataloader_train):
+                _debug_mem = (epoch == max(1, loaded_epoch + 1)) and (i < DEBUG_MEMORY_STEPS)
+                if _debug_mem:
+                    _mem_reset()
+
                 inputs = inputs.type(torch.FloatTensor).to(dist.device)
                 outputs = outputs.type(torch.FloatTensor).to(dist.device)
+                # Zero Gradients
                 optimizer.zero_grad()
+                if _debug_mem:
+                    _mem_report(f"step {i} after zero_grad (baseline)", dist.rank)
+                    _mem_reset()
+                # Compute Predictions
                 pred = (
                     model((inputs / input_norm).permute(0, 4, 1, 2, 3)).permute(
                         0, 2, 3, 4, 1
                     )
                     * output_norm
                 )
-                loss, loss_dict = mhd_loss(pred, outputs, inputs, return_loss_dict=True)
+                if _debug_mem:
+                    _mem_report(f"step {i} after FNO forward", dist.rank)
+                    _mem_reset()
+                # Compute Loss
+                loss, loss_dict = mhd_loss(pred, outputs, inputs)
+                if _debug_mem:
+                    _mem_report(f"step {i} after loss forward", dist.rank)
+                    _mem_reset()
+                # Compute Gradients for Back Propagation
                 loss.backward()
+                if _debug_mem:
+                    _mem_report(f"step {i} after backward", dist.rank)
+                # Update Weights
                 optimizer.step()
+                if _debug_mem:
+                    _mem_report(f"step {i} after optim step", dist.rank)
 
                 loss_dict = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
                 log.log_minibatch(loss_dict)
@@ -282,9 +350,7 @@ def main(cfg: DictConfig) -> None:
                         * output_norm
                     )
                     # Compute Loss
-                    loss, loss_dict = mhd_loss(
-                        pred, outputs, inputs, return_loss_dict=True
-                    )
+                    loss, loss_dict = mhd_loss(pred, outputs, inputs)
 
                     loss_dict = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
                     log.log_minibatch(loss_dict)
@@ -300,6 +366,9 @@ def main(cfg: DictConfig) -> None:
                             for index, name in enumerate(names):
                                 # Generate figure
                                 if use_wandb:
+                                    if i == 0 and j == 0 and index == 0:
+                                        print("SHAPES pred/true/inputs:", pred[j].shape, outputs[j].shape, inputs[j].shape)
+
                                     figs = plot_predictions_mhd_plotly(
                                         pred[j].cpu(),
                                         outputs[j].cpu(),

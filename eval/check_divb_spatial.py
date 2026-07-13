@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modifications copyright (c) 2026 Matthias Nägele.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -15,22 +14,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Visualise the spatial structure of finite-difference divB for a single
-BHAC sample at one or more time frames.
+"""Visualise the spatial structure of divB for a single BHAC sample at one or
+more time frames.
 
-Each requested time frame occupies one row with three columns:
-b1 | b2 | |divB|.
+The magnetic-field components b1, b2 are read from a BHAC sample (output
+channels 2 and 3, as in the loss code) and divB = d(b1)/dx + d(b2)/dy is
+computed exactly as in the loss's `mhd_constraint`: the derivative operator is
+selected by `--diff-type` (`fourier` for spectral derivatives, `fd` for finite
+differences on the periodic domain). Both operators share the same I/O
+contract — input (1, nt, nx, ny), output (1, 2*nt, nx, ny) with d/dx in
+channels [0:nt] and d/dy in channels [nt:2*nt] — so the slicing below is
+identical for either choice. The full time sequence (nt frames) is passed in
+one call, matching how the loss uses it.
+
+`--time-idx` accepts a comma-separated list of frames; each requested frame is
+plotted as one row of three columns: b1 | b2 | |divB|.
 
 Example:
-  python check_divB_spatial.py --time-idx 0,5,10 --out divB_spatial.png
+  python check_divb_spatial.py --diff-type fourier --time-idx 0,5,10 --out divB_spatial.png
 """
 
 import argparse
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from losses.fourier_derivatives import fourier_derivatives
 from losses.finite_diff import fd_derivatives_periodic
 
 
@@ -69,6 +80,13 @@ def parse_args():
         help="Comma-separated list of time-frame indices to plot, e.g. '0,5,10'.",
     )
     parser.add_argument(
+        "--diff-type",
+        choices=["fourier", "fd"],
+        default=None,
+        help="Derivative operator for divB. Defaults to loss_params.diff_type "
+        "in the config (matching the loss).",
+    )
+    parser.add_argument(
         "--out",
         type=str,
         default="divB_spatial.png",
@@ -79,12 +97,20 @@ def parse_args():
 def main():
     args = parse_args()
     cfg = OmegaConf.load(args.config)
+    # Run configs derive their paths from a sibling paths.yaml via Hydra's
+    # `defaults` list; OmegaConf.load doesn't process that, so compose the
+    # sibling paths.yaml (config/ or a checkpoint snapshot dir) when present so
+    # ${data_root}/${output_root} resolve. Harmless for already-literal configs.
+    paths_yaml = os.path.join(os.path.dirname(args.config), "paths.yaml")
+    if os.path.isfile(paths_yaml):
+        cfg = OmegaConf.merge(OmegaConf.load(paths_yaml), cfg)
     dp = cfg.dataset_params
     lp = cfg.loss_params
 
     # Fall back to config values if not given on the command line
     Lx = args.Lx if args.Lx is not None else float(lp.Lx)
     Ly = args.Ly if args.Ly is not None else float(lp.Ly)
+    diff_type = args.diff_type if args.diff_type is not None else str(lp.diff_type)
 
     # Parse requested time indices
     time_indices = [int(t) for t in args.time_idx.split(",")]
@@ -133,11 +159,13 @@ def main():
     print(f"x range      : [{x_vals[0]:.4f}, {x_vals[-1]:.4f}]  dx={x_vals[1]-x_vals[0]:.6f}")
     print(f"y range      : [{y_vals[0]:.4f}, {y_vals[-1]:.4f}]  dy={y_vals[1]-y_vals[0]:.6f}")
     print(f"Lx={Lx:.6f}  Ly={Ly:.6f}")
+    print(f"diff_type    : {diff_type}")
     print()
 
     # ------------------------------------------------------------------ #
-    # Compute Fourier divB over the FULL time sequence
+    # Compute divB over the FULL time sequence.
     # This exactly mirrors mhd_constraint() in the loss code:
+    #   - select the derivative operator from diff_type (fourier / fd)
     #   - pass the full (1, nt, nx, ny) tensor
     #   - x-deriv lives in channels [0 : nt]
     #   - y-deriv lives in channels [nt : 2*nt]
@@ -145,12 +173,13 @@ def main():
     b1_full = outputs[0, :, :, :, 2].unsqueeze(0).float()  # (1, nt, nx, ny)
     b2_full = outputs[0, :, :, :, 3].unsqueeze(0).float()
 
-    f_db1 = fd_derivatives_periodic(b1_full, [Lx, Ly])  # (1, 2*nt, nx, ny)
-    f_db2 = fd_derivatives_periodic(b2_full, [Lx, Ly])
+    deriv = fourier_derivatives if diff_type == "fourier" else fd_derivatives_periodic
+    f_db1 = deriv(b1_full, [Lx, Ly])  # (1, 2*nt, nx, ny)
+    f_db2 = deriv(b2_full, [Lx, Ly])
 
     # Sanity-check that the output has the expected layout
     assert f_db1.shape == (1, 2 * nt, nx, ny), (
-        f"Unexpected fourier_derivatives output shape: {f_db1.shape}, "
+        f"Unexpected {diff_type} derivative output shape: {f_db1.shape}, "
         f"expected (1, {2*nt}, {nx}, {ny})"
     )
 
@@ -212,8 +241,8 @@ def main():
         plt.colorbar(im2, ax=axes[row, 2])
 
     fig.suptitle(
-        f"sample_idx={args.sample_idx}  Lx={Lx:.4f}  Ly={Ly:.4f}  "
-        f"nt={nt}  nx={nx}  ny={ny}",
+        f"sample_idx={args.sample_idx}  diff_type={diff_type}  "
+        f"Lx={Lx:.4f}  Ly={Ly:.4f}  nt={nt}  nx={nx}  ny={ny}",
         fontsize=11,
     )
     plt.savefig(args.out, dpi=1600, bbox_inches="tight")

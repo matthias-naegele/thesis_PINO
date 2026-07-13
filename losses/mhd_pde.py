@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modifications copyright (c) 2026 Matthias Nägele.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -24,7 +23,7 @@ class MHD_PDE(PDE):
 
     name = "MHD_PDE"
 
-    def __init__(self, Gamma=4.0 / 3.0):
+    def __init__(self, Gamma=1.33333333333333):
         # x, y, time
         x, y, t = Symbol("x"), Symbol("y"), Symbol("t")
 
@@ -39,12 +38,12 @@ class MHD_PDE(PDE):
         rho = Function("rho")(*input_variables)
         e3 = Function("e3")(*input_variables)
         p = Function("p")(*input_variables)
-        # eta can later be promoted to eta(x, y) for spatially varying resistivity.
-        eta = Function("eta")(*input_variables)
+        eta = Function("eta")(*input_variables) # for future upgrade: eta can be fct of x,y
 
         # initialize constants
         Gamma = Number(Gamma)
 
+        # set equations
         self.equations = {}
 
         # compute Lorentz factor from u

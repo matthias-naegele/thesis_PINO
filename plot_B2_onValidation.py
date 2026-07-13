@@ -1,13 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 Matthias Nägele.
-# SPDX-License-Identifier: Apache-2.0
 """
 Plot domain-averaged B^2 vs time for validation data.
-
+ 
 Loads all checkpoints from the checkpoint directory (defined in the Hydra
 config at train_params.ckpt_path), evaluates the FNO model on the validation
 set, and produces one plot per validation sample per checkpoint showing
 <B^2>(t) for both the true solution and the model prediction.
-
+ 
 Usage:
     python plot_B2_onValidation.py --output_dir ./b2_plots
 """
@@ -257,7 +255,7 @@ def main(cfg: DictConfig) -> None:
                 ax.set_ylabel(r"$\langle B^2 \rangle$")
                 ax.set_title(
                     rf"$\eta = {eta_val:.2e}$, Epoch {ckpt_epoch}, "
-                    f"Sample {sample_idx}, Stride {data_loss_stride}"
+                    f"Sample {sample_idx}, Stride 8"
                 )
 
                 ax.set_yscale("log")
@@ -268,6 +266,7 @@ def main(cfg: DictConfig) -> None:
                 ax.set_ylim(bottom=1)
 
                 ax.legend(loc="upper right")
+                ax.legend()
                 plt.tight_layout()
  
                 save_path = os.path.join(

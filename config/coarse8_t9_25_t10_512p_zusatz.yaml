@@ -1,0 +1,275 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ============================================================================
+# coarse8 / 512p / t=9.25..10.0 ramping run on the ENLARGED dataset
+# (finished_512_zusatz: 38 train + 11 val sims instead of 23 + 6).
+#
+# Same run as coarse8_t9_25_t10_512p (which replays the fromWINNER
+# sweep winners, not the noSweep sequence) except:
+#   - data_dir points at finished_512_zusatz (old 6 val sims were renamed so
+#     they still sort into the val tail; val = old 6 + 5 new).
+#   - num/num_train/num_test updated to 49/38/11.
+#   - All per-epoch schedules are rescaled by 0.6 (~23/38) so the total number
+#     of training samples seen matches the 23-sim run (compute-matched
+#     comparison): LR milestones [25..150] -> [15..90], ckpt_freq 100 -> 60.
+#     The rescaled phase lengths and ramp increments are baked into
+#     `loss_params.weight_schedule` below (submitted via
+#     run_ramping_coarse8_t9_25_t10_512p_zusatz.sh).
+#   - New ckpt_path and wandb project (both suffixed _zusatz).
+#
+# Self-contained config so the ramping launcher can snapshot it into the
+# checkpoint dir (plot_index.py / plot_B2_onValidation.py load that snapshot).
+# ============================================================================
+
+
+defaults:
+  - paths      # data_root / output_root live in config/paths.yaml (edit there)
+  - wandb      # wandb_entity / wandb_mode live in config/wandb.yaml (edit there)
+  - _self_
+
+## Training options
+load_ckpt: True
+use_wandb: True
+# Reproducibility: RNG seed for model init + data shuffle order.
+seed: 0
+output_dir: ${output_root}
+# derivative: 'physicsnemo' # use 'physicsnemo' or 'original' method to take derivatives
+
+###################
+## Model options
+model_params:
+  layers: 48
+  modes: [10, 24, 24]
+  num_fno_layers: 4
+  fc_dim: 128
+  decoder_layers: 1
+  in_dim: 11 # 3 + in_fields
+  out_dim: 7
+  dimension: 3
+  pad_x: 0 # 5
+  pad_y: 0
+  pad_z: 5
+
+  input_norm: [
+    10.0,
+    6.270909786224365,
+    6.270909786224365,
+    1.009229241893173,
+    1.1580078196379973,
+    1.8550656856940995,
+    1.5237639564209606,
+    2.59764252411111,
+    1.608931561912946,
+    1.0,
+    3.841360012302175e-04
+  ]
+  output_norm: [
+    1, # 1205.9536538736907,
+    1, # 1830.9032530028053,
+    1, # 1805.956401608314,
+    1, # 2061.042622180051,
+    1, # 1637.037707764793,
+    1, # 1724.774650691096,
+    1, # 1109.335930897566
+  ]
+
+
+###################
+## Dataset options
+dataset_params:
+  data_dir: ${data_root}/finished_512_zusatz
+  output_names: 'output-????'
+  file_name: 'fno_uniform_level2.h5'
+  num_train: 38
+  num_test: 11
+  sub_x: 1
+  sub_t: 1
+  ind_x: null
+  # take time steps of the front
+  # sets the first used index
+  ind_t_start: 370
+  # take time steps of the end
+  # set null if unused
+  # sets the last non-used index
+  ind_t: 401
+  fields: ['u1','u2','b1','b2','p','e3','rho']
+
+###################
+## Dataloader options
+train_loader_params:
+  batch_size: 1
+  shuffle: True
+  num_workers: 20
+  pin_memory: True
+
+val_loader_params:
+  batch_size: 1
+  shuffle: False
+  num_workers: 20
+  pin_memory: True
+
+###################
+## Loss options
+loss_params:
+  Gamma: 1.333333333333333333333333333333333333333333333333333333333333
+
+  # Starting weights (before phase 0). The full multi-phase ramp now lives in
+  # `weight_schedule` below, so the launcher runs a single training job. The
+  # flat `*_ramp_*` knobs are unused when a schedule is set.
+  data_weight: 1
+  ic_weight: 0.0
+  pde_weight: 0.00
+  constraint_weight: 0
+
+  pde_weight_ramp_epoch: 0
+  pde_weight_ramp_increment: 0.0
+  constraint_weight_ramp_epoch: 0
+  constraint_weight_ramp_increment: 0.0
+
+  data_weight_ramp_epoch: 0
+  data_weight_ramp_decrement: 0.0
+  data_weight_floor: 0.0
+
+  # Per-epoch weight schedule (baked-in replacement for the old per-phase
+  # launcher sequence). This is the coarse8 "fromWINNER" run rescaled to the
+  # enlarged (zusatz) dataset: phase lengths x0.6 and per-epoch increments
+  # x5/3, so the per-phase weights track the 23-sim original. pde/constraint
+  # ramp up from 0 and data_weight decays, all every epoch; weights flow
+  # continuously across boundaries. Per-epoch increments per phase:
+  weight_schedule:
+    - epochs: 60         # phase 0: data only, no physics
+    - epochs: 180        # phase 1
+      pde_weight_ramp_epoch: 1
+      pde_weight_ramp_increment: 5.3333e-5
+      constraint_weight_ramp_epoch: 1
+      constraint_weight_ramp_increment: 1.8333e-4
+      data_weight_ramp_epoch: 1
+      data_weight_ramp_decrement: 1.6333e-3
+    - epochs: 240        # phase 2
+      pde_weight_ramp_epoch: 1
+      pde_weight_ramp_increment: 7.8333e-5
+      constraint_weight_ramp_epoch: 1
+      constraint_weight_ramp_increment: 7.1667e-4
+      data_weight_ramp_epoch: 1
+      data_weight_ramp_decrement: 6.1667e-4
+    - epochs: 240        # phase 3
+      pde_weight_ramp_epoch: 1
+      pde_weight_ramp_increment: 1.6667e-5
+      constraint_weight_ramp_epoch: 1
+      constraint_weight_ramp_increment: 1.0667e-3
+      data_weight_ramp_epoch: 1
+      data_weight_ramp_decrement: 5.8333e-4
+    - epochs: 360        # phase 4
+      pde_weight_ramp_epoch: 1
+      pde_weight_ramp_increment: 1.0833e-5
+      constraint_weight_ramp_epoch: 1
+      constraint_weight_ramp_increment: 4.0e-4
+      data_weight_ramp_epoch: 1
+      data_weight_ramp_decrement: 2.1667e-4
+    - epochs: 600        # phase 5
+      pde_weight_ramp_epoch: 1
+      pde_weight_ramp_increment: 6.8333e-6
+      constraint_weight_ramp_epoch: 1
+      constraint_weight_ramp_increment: 3.3333e-4
+      data_weight_ramp_epoch: 1
+      data_weight_ramp_decrement: 4.5e-5
+
+  use_data_loss: True
+  use_ic_loss: False  # ! unused, non-adjusted PhysicsNeMo carry-over (see ic_loss in loss_mhd_physicsnemo.py)
+  use_pde_loss: True
+  use_constraint_loss: True
+
+  u1_weight: 1.0
+  u2_weight: 1.0
+  b1_weight: 1.0
+  b2_weight: 1.0
+  p_weight: 1.0
+  e3_weight: 1.0
+  rho_weight: 1.0
+
+  # PDE weight
+  # weight among different PDEs
+  FI1_weight: 10
+  FI2_weight: 10
+  MO_weight: 1000
+  ES0_weight: 0.0001
+  ES1_weight: 0.0001
+  ES2_weight: 0.0001
+  C1_weight: 1
+
+  # Constraint: use constraint_weight instead
+  div_B_weight: 1 # also useless for one constraint with weighted_mean
+
+  Lx: 6.283185307 # physical scale of the simulation
+  Ly: 6.283185307
+
+  # no meaning anymore but leave in
+  tend: 0.06484 # 10 # physical time of the simulation
+
+  # relative weighting within on class
+  use_weighted_mean: False
+
+  # stride for data loss timesteps (2 = every second timestep, 1 = off)
+  data_loss_stride: 1
+
+  # Spatial downsampling factor for the ENFORCED data loss (1 = off).
+  # coarse8 run -> factor 8 (the ramp sequence itself still comes from the
+  # coarse4_betterSweep winner, replayed via `weight_schedule` above).
+  data_loss_coarse_factor: 8
+
+  # diff type
+  diff_type: 'fourier'
+
+###################
+## Optimizer options
+optimizer_params:
+  betas: [0.9, 0.999]
+  lr: 0.003 # 0.001
+  # Original run: [25, 50, 75, 100, 125, 150]; scaled by 0.6 so the LR decays
+  # at the same number of training samples seen as with 23 train sims.
+  milestones: [15, 30, 45, 60, 75, 90]
+  gamma: 0.5
+  weight_decay: 0.1
+
+
+###################
+## Train params
+train_params:
+  epochs: 1680
+  # 60 instead of 100 (x0.6) so phase boundaries 60/240/480/720/1080/1680 all
+  # land on a checkpoint; same 28 checkpoints in total as the original run.
+  ckpt_freq: 60
+  ckpt_path: ${output_root}/checkpoints/coarse8_t9_25_t10_512p_zusatz
+
+###################
+## wandb params
+wandb_params:
+  wandb_dir: ${output_root}/wandb
+  wandb_project: 'MHD_coarse8_baked'
+  wandb_group: 'coarse8_t9_25_t10_512p_zusatz'
+  wandb_num_plots: 0
+  # Deliberately set far above the run's epoch count: the in-training
+  # wandb prediction plots were not used, so this large period disables
+  # them (the plotting block only fires when epoch % wandb_plot_freq == 0).
+  wandb_plot_freq: 3500
+  wandb_plot_types: ['ic', 'pred', 'true', 'error']
+  wandb_mode: ${wandb_mode}
+  wandb_entity: ${wandb_entity}
+  # this index starts at t_ind_start; the loaded window is 31 steps (370..400)
+  # so keep it inside [0, 30].
+  wandb_plot_index_t: 30
+

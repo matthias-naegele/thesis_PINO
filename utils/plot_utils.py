@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modifications copyright (c) 2026 Matthias Nägele.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -15,76 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import numpy as np
-
 import torch
 
 import matplotlib.pyplot as plt
-import matplotlib
-import imageio
-import plotly
 import plotly.express as px
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
-
-
-def plot_spectra_mhd(
-    k,
-    pred_spectra_kin,
-    true_spectra_kin,
-    pred_spectra_mag,
-    true_spectra_mag,
-    index_t=-1,
-    name="Re100",
-    save_path=None,
-    save_suffix=None,
-    font_size=None,
-    sci_limits=None,
-    style_kin_pred="b-",
-    style_kin_true="k-",
-    style_mag_pred="b--",
-    style_mag_true="k--",
-    xmin=0,
-    xmax=200,
-    ymin=1e-10,
-    ymax=None,
-):
-    "Plots spectra of predicted and true outputs"
-    if font_size is not None:
-        plt.rcParams.update({"font.size": font_size})
-
-    if sci_limits is not None:
-        plt.rcParams.update({"axes.formatter.limits": sci_limits})
-
-    E_kin_pred = pred_spectra_kin[index_t]
-    E_mag_pred = pred_spectra_mag[index_t]
-
-    E_kin_true = true_spectra_kin[index_t]
-    E_mag_true = true_spectra_mag[index_t]
-
-    fig = plt.figure(figsize=(6, 5))
-
-    plt.loglog(k, E_kin_pred, style_kin_pred, label="$E_{kin}$ Pred")
-    plt.loglog(k, E_kin_true, style_kin_true, label="$E_{kin}$ True")
-    plt.loglog(k, E_mag_pred, style_mag_pred, label="$E_{mag}$ Pred")
-    plt.loglog(k, E_mag_true, style_mag_true, label="$E_{mag}$ True")
-
-    plt.xlabel("k")
-    plt.ylabel("E(k)")
-    plt.axis([xmin, xmax, ymin, ymax])
-
-    plt.title(f"Spectra ${name}$")
-    plt.legend(loc="upper right")
-
-    if save_path is not None:
-        if save_suffix is not None:
-            figure_path = f"{save_path}_spectra_{save_suffix}.png"
-        else:
-            figure_path = f"{save_path}_spectra.png"
-        plt.savefig(figure_path, bbox_inches="tight")
-
-    return fig
 
 
 def plot_predictions_mhd(
@@ -167,132 +100,6 @@ def plot_predictions_mhd(
     # plt.show()
     # return fig
     plt.close()
-
-
-def generate_movie_2D(
-    preds_y,
-    test_y,
-    test_x,
-    key=0,
-    plot_title="",
-    field=0,
-    val_cbar_index=-1,
-    err_cbar_index=-1,
-    val_clim=None,
-    err_clim=None,
-    font_size=None,
-    movie_dir="",
-    movie_name="movie.gif",
-    frame_basename="movie",
-    frame_ext="jpg",
-    cmap="jet",
-    shading="gouraud",
-    remove_frames=True,
-):
-    "Generates a movie of the exact, predicted, and absolute error fields"
-    frame_files = []
-
-    if movie_dir:
-        os.makedirs(movie_dir, exist_ok=True)
-
-    if font_size is not None:
-        plt.rcParams.update({"font.size": font_size})
-
-    pred = preds_y[key][..., field]
-    true = test_y[key][..., field]
-    inputs = test_x[key]
-    error = pred - true
-
-    Nt, Nx, Ny = pred.shape
-
-    t = inputs[:, 0, 0, 0]
-    x = inputs[0, :, 0, 1]
-    y = inputs[0, 0, :, 2]
-    X, Y = torch.meshgrid(x, y, indexing="ij")
-
-    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-    ax1 = axs[0]
-    ax2 = axs[1]
-    ax3 = axs[2]
-
-    pcm1 = ax1.pcolormesh(
-        X, Y, true[val_cbar_index], cmap=cmap, label="true", shading=shading
-    )
-    pcm2 = ax2.pcolormesh(
-        X, Y, pred[val_cbar_index], cmap=cmap, label="pred", shading=shading
-    )
-    pcm3 = ax3.pcolormesh(
-        X, Y, error[err_cbar_index], cmap=cmap, label="error", shading=shading
-    )
-
-    if val_clim is None:
-        val_clim = pcm1.get_clim()
-    if err_clim is None:
-        err_clim = pcm3.get_clim()
-
-    pcm1.set_clim(val_clim)
-    plt.colorbar(pcm1, ax=ax1)
-    ax1.axis("square")
-    ax1.set_axis_off()
-
-    pcm2.set_clim(val_clim)
-    plt.colorbar(pcm2, ax=ax2)
-    ax2.axis("square")
-    ax2.set_axis_off()
-
-    pcm3.set_clim(err_clim)
-    plt.colorbar(pcm3, ax=ax3)
-    ax3.axis("square")
-    ax3.set_axis_off()
-
-    plt.tight_layout()
-
-    for i in range(Nt):
-        # Exact
-        ax1.clear()
-        pcm1 = ax1.pcolormesh(X, Y, true[i], cmap=cmap, label="true", shading=shading)
-        pcm1.set_clim(val_clim)
-        ax1.set_title(f"Exact {plot_title}: $t={t[i]:.2f}$")
-        ax1.axis("square")
-        ax1.set_axis_off()
-
-        # Predictions
-        ax2.clear()
-        pcm2 = ax2.pcolormesh(X, Y, pred[i], cmap=cmap, label="pred", shading=shading)
-        pcm2.set_clim(val_clim)
-        ax2.set_title(f"Predict {plot_title}: $t={t[i]:.2f}$")
-        ax2.axis("square")
-        ax2.set_axis_off()
-
-        # Error
-        ax3.clear()
-        pcm3 = ax3.pcolormesh(X, Y, error[i], cmap=cmap, label="error", shading=shading)
-        pcm3.set_clim(err_clim)
-        ax3.set_title(f"Error {plot_title}: $t={t[i]:.2f}$")
-        ax3.axis("square")
-        ax3.set_axis_off()
-
-        #         plt.tight_layout()
-        fig.canvas.draw()
-
-        if movie_dir:
-            frame_path = os.path.join(movie_dir, f"{frame_basename}-{i:03}.{frame_ext}")
-            frame_files.append(frame_path)
-            plt.savefig(frame_path, bbox_inches="tight")
-
-    if movie_dir:
-        movie_path = os.path.join(movie_dir, movie_name)
-        with imageio.get_writer(movie_path, mode="I") as writer:
-            for frame in frame_files:
-                image = imageio.imread(frame)
-                writer.append_data(image)
-
-    if movie_dir and remove_frames:
-        for frame in frame_files:
-            try:
-                os.remove(frame)
-            except OSError:
-                pass
 
 
 def plot_predictions_mhd_plotly(

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2026 Matthias Nägele.
-# SPDX-License-Identifier: Apache-2.0
 """
 Analyse the divB channel from an FNO-style HDF5 file.
 
@@ -83,7 +81,7 @@ def main():
     if not h5path.exists():
         raise FileNotFoundError(h5path)
 
-    # metadata pass
+    # ── metadata pass ────────────────────────────────────────────────────────
     with h5py.File(h5path, "r") as f:
         varnames = decode_varnames(f["varnames"][:])
         T, C, Ny, Nx = f["fields"].shape
@@ -100,7 +98,7 @@ def main():
     print(f"t range    : {t_arr[0]:.4g} → {t_arr[-1]:.4g}")
     print()
 
-    # validate requested frame indices
+    # ── validate requested frame indices ─────────────────────────────────────
     requested = []
     for fi in args.frames:
         if fi < 0 or fi >= T:
@@ -111,11 +109,11 @@ def main():
     if not requested:
         raise ValueError("No valid frame indices to analyse.")
 
-    # chunked analysis
+    # ── chunked analysis ──────────────────────────────────────────────────────
     print("Computing divB statistics …")
     stats = analyse_divb_at_indices(h5path, c_idx, requested, t_arr, args.chunk)
 
-    # report
+    # ── report ────────────────────────────────────────────────────────────────
     col = 14
     header = (f"{'frame':>6}  {'t':>{col}}"
               f"  {'mean|divB|':>{col}}  {'max|divB|':>{col}}  {'MSE(divB,0)':>{col}}")
@@ -132,7 +130,7 @@ def main():
     print(sep)
     print()
 
-    # aggregate summary
+    # ── aggregate summary ─────────────────────────────────────────────────────
     all_mse      = [stats[i]["mse"]      for i in requested]
     all_max      = [stats[i]["max_abs"]  for i in requested]
     all_mean_abs = [stats[i]["mean_abs"] for i in requested]
@@ -142,7 +140,7 @@ def main():
     print(f"  mean mean|divB| = {np.mean(all_mean_abs):.6e}")
     print(f"  max  MSE        = {max(all_mse):.6e}")
 
-    # scaling check (max|divB| * N^2 should be O(1) for a healthy CT scheme)
+    # ── scaling check ─────────────────────────────────────────────────────────
     N_eff = min(Nx, Ny)
     print()
     print(f"CT scaling reference  (1/N²  for N={N_eff}): {1.0/N_eff**2:.6e}")

@@ -25,8 +25,10 @@ This is the code accompanying my Master's thesis at the University of Würzburg
   unseen resistivities at *unsupervised* timesteps.
 - **Spectral (Fourier) derivatives** for the residual on a periodic domain,
   avoiding the memory cost of full Laplacian buffers.
-- **Multi-phase weight schedule** — data-only warm-up, then a ramped PDE term
-  with rate steps at epochs 500, 700, 1100.
+- **Multi-phase weight schedule** — a data-only warm-up (the first 100 epochs),
+  then the PDE and ∇·B weights ramp per-epoch through a declarative multi-phase
+  schedule baked into each run config (2800 epochs total for the canonical
+  runs; see `losses/weight_schedule.py`).
 - **Multi-GPU training** with NVIDIA PhysicsNeMo + DistributedDataParallel
   (3× L40).
 
@@ -47,6 +49,30 @@ squared SRRMHD residual evaluated via Fourier derivatives at every timestep,
 and ℒ_∇·B is a soft divergence-free constraint on B. The PDE weight is held
 at zero during a data-only warm-up and then ramped through a multi-phase
 schedule.
+
+### Data-loss time striding (`data_loss_stride`)
+
+The `stride8_*` runs realize the sparse supervision with a plain Python stride:
+when `data_loss_stride > 1`, the enforced data loss is only applied to a
+subsampled set of timesteps,
+
+```python
+pred_sub = pred[:, ::self.data_loss_stride]   # losses/loss_mhd_physicsnemo.py
+```
+
+so the **penalized** timestep positions are `range(0, T, stride)`, where
+`T = pred.shape[1]` is the number of timesteps in the rollout window. For
+`data_loss_stride = 8` that is positions `0, 8, 16, 24, …`; every position in
+between is a *skipped* timestep that receives no enforced data loss (its
+full-resolution loss is still tracked for logging as `skipped_data_loss`, but
+never backpropagated). The `coarse8_*` runs instead achieve the same 8×
+supervision sparsity by training on temporally coarsened data.
+
+**Interpreting checkpoint plots:** these are positions *within the model's
+rollout window*, not absolute BHAC timestep numbers. If a config's window
+starts at absolute timestep `t0`, then penalized position `i` corresponds to
+absolute BHAC timestep `t0 + i`. Expect the model to fit best on the penalized
+positions and to be relatively unconstrained on the in-between frames.
 
 ## Results
 
@@ -70,7 +96,7 @@ track the full BHAC reference trajectory.
 Loss measured *only* at timesteps without data supervision. Without the PDE
 loss (red), training stalls and then trends upward — the model overfits the
 labeled frames. With the PDE loss switched on at epoch 100 (blue), the loss
-keeps decreasing through epoch 2000.
+keeps decreasing.
 
 ### Plasmoid formation
 
@@ -83,11 +109,15 @@ re-emerges. Figures are reproduced in the paper.
 ## Data
 
 Reference simulations are produced with **BHAC** on a 256² base grid with 5
-levels of adaptive mesh refinement.
+levels of adaptive mesh refinement; the `BHAC/` directory holds the simulation
+setup and the flatten-to-h5 converter that turns raw BHAC output into the
+`fno_uniform_*.h5` training files.
 
 - **Training set** — 23 simulations spanning η ∈ [10⁻⁴, 10⁻³], covering the
   Sweet–Parker and fast reconnection regimes.
 - **Validation set** — 6 unseen resistivities.
+- The `*_zusatz` runs use an enlarged dataset (38 train / 11 val simulations)
+  with the schedule rescaled to keep total samples-seen comparable.
 - All reported metrics are evaluated on validation samples at timesteps
   *without* data supervision.
 
@@ -95,16 +125,40 @@ levels of adaptive mesh refinement.
 
 | Path | Purpose |
 |---|---|
-| `train_bhac.py` | Hydra-driven training entrypoint. |
-| `config/mhd_bhac.yaml` | All hyperparameters. |
+| `train_bhac.py` | Hydra-driven training entrypoint (distributed via `torchrun`). |
+| `config/` | Hydra configs. The canonical runs are the self-contained `*_t*.yaml` configs; `paths.yaml` holds the machine paths (`data_root` / `output_root`). |
 | `losses/loss_mhd_physicsnemo.py` | Combined data + PDE + ∇·B loss. |
 | `losses/mhd_pde.py` | SRRMHD residual definitions via PhysicsNeMo Sym. |
+| `losses/weight_schedule.py` | Declarative per-epoch loss-weight ramp. |
 | `losses/fourier_derivatives.py`, `losses/finite_diff.py` | Spectral and FD derivative kernels. |
 | `dataloaders/` | BHAC HDF5 readers and the `(inputs, outputs)` builder. |
+| `run_ramping_*.sh` | SLURM launchers for the canonical training runs. |
+| `launchers_noPDE/` | SLURM launchers for the data-only control runs. |
+| `plot_index.py`, `plot_B2_onValidation.py`, `plot_at_epoch.sh` | Figure scripts for validation analyses on trained checkpoints. |
+| `plotters/` | Standalone figure scripts (collages, wandb comparisons, PDE-residual maps) writing PNGs under `figs/`. |
 | `utils/plot_utils.py` | Matplotlib / plotly prediction plots. |
-| `plot_index.py`, `plot_B2_onValidation*.py` | Figure scripts for validation analyses. |
-| `eval/` | Standalone sanity checks (∇·B statistics, per-channel norms, PDE residual on raw BHAC data). |
-| `scripts/` | SLURM launchers for training, the ramping schedule, and figure plotting. |
+| `eval/` | Standalone sanity checks (∇·B statistics, per-channel norms, losses on raw BHAC data). |
+| `BHAC/` | BHAC simulation setup, the h5 converter, and the resistivity documentation. |
+| `docs/` | Design and reproducibility notes (environment, run recipes). |
+
+## How to run
+
+Training runs on an HPC cluster via SLURM: submit one of the
+`run_ramping_*.sh` scripts with `sbatch`. Under the hood they launch
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=3 train_bhac.py \
+    --config-name <config_name>
+```
+
+and snapshot the config into the checkpoint directory for provenance. The
+whole multi-phase physics ramp is driven by the config's
+`loss_params.weight_schedule` in a single job, replayed deterministically on
+resume (`RESUME=1`). Machine paths live in `config/paths.yaml` and the wandb
+account (`wandb_entity` / `wandb_mode`) in `config/wandb.yaml` — the only two
+files to edit when running under a new account. Dependencies are pinned in
+`requirements.txt`;
+hardware/runtime details are in `docs/environment.md`.
 
 ## Paper
 

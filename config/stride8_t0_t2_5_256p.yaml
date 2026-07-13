@@ -1,0 +1,221 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ============================================================================
+# stride8 / 256p / t=0.0..2.5 ramping run.
+#
+# data_loss_stride=8 (every 8th timestep supervised) on the level1 "finished"
+# 256p data, real-time window t=0.0..2.5 (snapshot indices 0..100, dt=0.025).
+# This run uses a reduced FNO architecture: layers 64 and modes [8,8,8] (fewer
+# Fourier modes, deeper width) rather than the layers-48 / modes-[10,24,24]
+# setup of the other runs. The physics-loss ramp is baked into
+# `loss_params.weight_schedule` below (submitted via
+# run_ramping_stride8_t0_t2_5_256p.sh).
+# ============================================================================
+
+
+defaults:
+  - paths      # data_root / output_root live in config/paths.yaml (edit there)
+  - wandb      # wandb_entity / wandb_mode live in config/wandb.yaml (edit there)
+  - _self_
+
+## Training options
+load_ckpt: True            # resume from an existing checkpoint if present (used by RESUME=1)
+use_wandb: True
+# Reproducibility: RNG seed for model init + data shuffle order.
+seed: 0
+output_dir: ${output_root}
+
+###################
+## Model options  (EXACT - must match the checkpoint to load weights)
+model_params:
+  layers: 64
+  modes: [8, 8, 8]
+  num_fno_layers: 4
+  fc_dim: 128
+  decoder_layers: 1
+  in_dim: 11 # 3 + in_fields
+  out_dim: 7
+  dimension: 3
+  pad_x: 0
+  pad_y: 0
+  pad_z: 5
+  input_norm: [
+    10.0,
+    6.270909786224365,
+    6.270909786224365,
+    1.009229241893173,
+    1.1580078196379973,
+    1.8550656856940995,
+    1.5237639564209606,
+    2.59764252411111,
+    1.608931561912946,
+    1.0,
+    3.841360012302175e-04
+  ]
+  output_norm: [1, 1, 1, 1, 1, 1, 1]
+
+###################
+## Dataset options  (EXACT - from ramping.sh / mhd_bhac.yaml)
+dataset_params:
+  # Read straight from the data dir (no /tmp copy in the launcher).
+  data_dir: ${data_root}/finished
+  output_names: 'output-????'
+  file_name: 'fno_uniform_level1.h5'
+  num_train: 23
+  num_test: 6
+  sub_x: 1
+  sub_t: 1
+  ind_x: null
+  ind_t_start: 0
+  ind_t: 101
+  fields: ['u1','u2','b1','b2','p','e3','rho']
+
+###################
+## Dataloader options
+train_loader_params:
+  batch_size: 1
+  shuffle: True
+  num_workers: 20
+  pin_memory: True
+
+val_loader_params:
+  batch_size: 1
+  shuffle: False
+  num_workers: 20
+  pin_memory: True
+
+###################
+## Loss options
+loss_params:
+  Gamma: 1.333333333333333333333333333333333333333333333333333333333333
+
+  # Starting weights (before phase 0). The full multi-phase pde/constraint
+  # ramp now lives in `weight_schedule` below, so the launcher runs a single
+  # training job. The flat `*_ramp_*` knobs are unused when a schedule is set.
+  data_weight: 1.0       # constant for this run (no data-weight decay)
+  ic_weight: 0.0
+  pde_weight: 0.0
+  constraint_weight: 0.0
+
+  pde_weight_ramp_epoch: 0
+  pde_weight_ramp_increment: 0.0
+  constraint_weight_ramp_epoch: 0
+  constraint_weight_ramp_increment: 0.0
+
+  data_weight_ramp_epoch: 0
+  data_weight_ramp_decrement: 0.0
+  data_weight_floor: 0.0
+
+  # Per-epoch weight schedule (baked-in replacement for the old per-phase
+  # launcher sequence). data_weight is held constant; pde/constraint ramp up.
+  # Phase 1's `set` switches physics on (a discontinuous 0 -> small jump);
+  # weights then flow continuously across the remaining phase boundaries.
+  # Phase-end weights (pde / con): p1 3.35e-4 / 0.0268, p2 8.35e-4 / 0.0492,
+  # p3 2.835e-3 / 0.1062, p4 keeps climbing.
+  weight_schedule:
+    - epochs: 100        # phase 0: data only, no physics
+    - epochs: 400        # phase 1
+      set: {pde_weight: 5.0e-6, constraint_weight: 4.0e-4}
+      pde_weight_ramp_epoch: 12
+      pde_weight_ramp_increment: 1.0e-5
+      constraint_weight_ramp_epoch: 12
+      constraint_weight_ramp_increment: 8.0e-4
+    - epochs: 200        # phase 2
+      pde_weight_ramp_epoch: 4
+      pde_weight_ramp_increment: 1.0e-5
+      constraint_weight_ramp_epoch: 7
+      constraint_weight_ramp_increment: 8.0e-4
+    - epochs: 400        # phase 3
+      pde_weight_ramp_epoch: 4
+      pde_weight_ramp_increment: 2.0e-5
+      constraint_weight_ramp_epoch: 7
+      constraint_weight_ramp_increment: 1.0e-3
+    - epochs: 900        # phase 4 (ramping.sh phase-4 rates; keeps climbing)
+      pde_weight_ramp_epoch: 4
+      pde_weight_ramp_increment: 2.2e-5
+      constraint_weight_ramp_epoch: 7
+      constraint_weight_ramp_increment: 5.0e-4
+
+  use_data_loss: True
+  use_ic_loss: False  # ! unused, non-adjusted PhysicsNeMo carry-over (see ic_loss in loss_mhd_physicsnemo.py)
+  use_pde_loss: True
+  use_constraint_loss: True
+
+  u1_weight: 1.0
+  u2_weight: 1.0
+  b1_weight: 1.0
+  b2_weight: 1.0
+  p_weight: 1.0
+  e3_weight: 1.0
+  rho_weight: 1.0
+
+  # PDE weight: weight among different PDEs
+  FI1_weight: 10
+  FI2_weight: 10
+  MO_weight: 1000
+  ES0_weight: 0.0001
+  ES1_weight: 0.0001
+  ES2_weight: 0.0001
+  C1_weight: 1
+
+  div_B_weight: 1
+
+  Lx: 6.283185307
+  Ly: 6.283185307
+
+  tend: 0.06484
+
+  use_weighted_mean: False
+
+  data_loss_stride: 8
+  data_loss_coarse_factor: 1      # off = full-res ("256p")
+
+  diff_type: 'fourier'
+
+###################
+## Optimizer options
+optimizer_params:
+  betas: [0.9, 0.999]
+  lr: 0.003
+  milestones: [25, 50, 75, 100, 125, 150]
+  gamma: 0.5
+  weight_decay: 0.1
+
+###################
+## Train params  (the full schedule runs in a single job; see weight_schedule)
+train_params:
+  epochs: 2000
+  ckpt_freq: 100
+  ckpt_path: ${output_root}/checkpoints/stride8_t0_t2_5_256p
+
+###################
+## wandb params
+wandb_params:
+  wandb_dir: ${output_root}/wandb
+  wandb_project: 'MHD_stride8_baked'
+  wandb_group: 'stride8_t0_t2_5_256p'
+  wandb_num_plots: 0
+  # Deliberately set far above the run's epoch count: the in-training
+  # wandb prediction plots were not used, so this large period disables
+  # them (the plotting block only fires when epoch % wandb_plot_freq == 0).
+  wandb_plot_freq: 3500
+  wandb_plot_types: ['ic', 'pred', 'true', 'error']
+  wandb_mode: ${wandb_mode}
+  wandb_entity: ${wandb_entity}
+  # this index starts at ind_t_start
+  wandb_plot_index_t: 96
+

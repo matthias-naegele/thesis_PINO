@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modifications copyright (c) 2026 Matthias Nägele.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -20,17 +19,20 @@ from .losses import LpLoss
 from .fourier_derivatives import fourier_derivatives
 from .mhd_pde import MHD_PDE
 from .finite_diff import fd_derivatives_periodic
+from . import weight_schedule as weight_schedule_lib
 
 class LossMHD_PhysicsNeMo(object):
     "Calculate loss for MHD equations with magnetic field, using physicsnemo derivatives"
 
     def __init__(
         self,
-        Gamma=4.0 / 3.0,
+        Gamma=1.333333333333333333,
         data_weight=1.0,
+        ic_weight=0,
         pde_weight=0,
         constraint_weight=0,
         use_data_loss=False,
+        use_ic_loss=False,  # ! unused PhysicsNeMo carry-over; see ic_loss()
         use_pde_loss=False,
         use_constraint_loss=False,
         u1_weight=1.0,
@@ -54,7 +56,6 @@ class LossMHD_PhysicsNeMo(object):
         use_weighted_mean=False,
         data_loss_stride=1,
         data_loss_coarse_factor=1,
-        physics_loss_stride=1,
         pde_weight_ramp_epoch=0,
         pde_weight_ramp_increment=0,
         constraint_weight_ramp_epoch=0,
@@ -62,14 +63,17 @@ class LossMHD_PhysicsNeMo(object):
         data_weight_ramp_epoch=0,
         data_weight_ramp_decrement=0,
         data_weight_floor=0.0,
+        weight_schedule=None,
         diff_type='fourier',
         **kwargs,
-    ):  # **kwargs lets us pass a full config dict and ignore extra keys
+    ):  # add **kwards so that we ignore unexpected kwargs when passing a config dict
         self.Gamma = Gamma
         self.data_weight = data_weight
+        self.ic_weight = ic_weight
         self.pde_weight = pde_weight
         self.constraint_weight = constraint_weight
         self.use_data_loss = use_data_loss
+        self.use_ic_loss = use_ic_loss
         self.use_pde_loss = use_pde_loss
         self.use_constraint_loss = use_constraint_loss
         self.u1_weight = u1_weight
@@ -93,7 +97,6 @@ class LossMHD_PhysicsNeMo(object):
         self.use_weighted_mean = use_weighted_mean
         self.data_loss_stride = data_loss_stride
         self.data_loss_coarse_factor = data_loss_coarse_factor
-        self.physics_loss_stride = physics_loss_stride
         # Define 2D MHD PDEs
         self.mhd_pde_eq = MHD_PDE(self.Gamma)
         self.mhd_pde_node = self.mhd_pde_eq.make_nodes()
@@ -111,27 +114,91 @@ class LossMHD_PhysicsNeMo(object):
 
         if not self.use_data_loss:
             self.data_weight = 0
+        if not self.use_ic_loss:
+            self.ic_weight = 0
         if not self.use_pde_loss:
             self.pde_weight = 0
         if not self.use_constraint_loss:
             self.constraint_weight = 0
 
-    def __call__(self, pred, true, inputs, return_loss_dict=False):
-        if not return_loss_dict:
-            loss = self.compute_loss(pred, true, inputs)
-            return loss
-        else:
-            loss, loss_dict = self.compute_losses(pred, true, inputs)
-            return loss, loss_dict
+        # ------------------------------------------------------------------
+        # Declarative per-epoch weight schedule (optional).
+        #
+        # When `weight_schedule` is given, it fully drives the data/PDE/
+        # constraint weight ramps and the flat `*_ramp_*` knobs above are
+        # ignored. The schedule is an ordered list of phases (see
+        # losses/weight_schedule.py) that the loss walks through as training
+        # progresses, so a multi-phase ramp can live entirely in the config
+        # instead of being scripted as a sequence of separate training runs in
+        # the launcher. `restore_weight_state` replays it on checkpoint resume.
+        # The constructor weights (data/pde/constraint) are the starting
+        # values, before phase 0.
+        # ------------------------------------------------------------------
+        self._weight_schedule = weight_schedule_lib.parse_weight_schedule(weight_schedule)
+        self._init_weights = {
+            "data": self.data_weight,
+            "pde": self.pde_weight,
+            "constraint": self.constraint_weight,
+        }
+        if self._weight_schedule is not None:
+            # Apply phase-0 start overrides (if any) so epoch 1 trains with
+            # the schedule's intended weights.
+            self._set_weights(
+                weight_schedule_lib.state_after(
+                    self._weight_schedule, self._init_weights, 0, self.data_weight_floor
+                )
+            )
+
+    def __call__(self, pred, true, inputs):
+        loss, loss_dict = self.compute_losses(pred, true, inputs)
+        return loss, loss_dict
     def step_weights(self):
-        """Call once per epoch to ramp PDE/constraint up and data down."""
+        """Call once per epoch (after the epoch) to ramp the loss weights.
+
+        With a `weight_schedule`, the active phase drives the ramp; otherwise
+        the flat `*_ramp_*` knobs are used (legacy single-phase behavior).
+        """
         self._epoch_count += 1
+        if self._weight_schedule is not None:
+            weights = {
+                "data": self.data_weight,
+                "pde": self.pde_weight,
+                "constraint": self.constraint_weight,
+            }
+            weight_schedule_lib.step(
+                self._weight_schedule, weights, self._epoch_count, self.data_weight_floor
+            )
+            self._set_weights(weights)
+            return
         if self.pde_weight_ramp_epoch > 0 and self._epoch_count % self.pde_weight_ramp_epoch == 0:
             self.pde_weight += self.pde_weight_ramp_increment
         if self.constraint_weight_ramp_epoch > 0 and self._epoch_count % self.constraint_weight_ramp_epoch == 0:
             self.constraint_weight += self.constraint_weight_ramp_increment
         if self.data_weight_ramp_epoch > 0 and self._epoch_count % self.data_weight_ramp_epoch == 0:
             self.data_weight = max(self.data_weight_floor, self.data_weight - self.data_weight_ramp_decrement)
+
+    def _set_weights(self, weights):
+        """Write back a {data, pde, constraint} working-weights dict."""
+        self.data_weight = weights["data"]
+        self.pde_weight = weights["pde"]
+        self.constraint_weight = weights["constraint"]
+
+    def restore_weight_state(self, epoch):
+        """Re-derive the loss weights for a run resumed at `epoch`.
+
+        Only meaningful with a `weight_schedule`: replays the per-epoch ramp
+        from scratch (via losses/weight_schedule.py) so a checkpoint-resumed
+        run continues with exactly the weights it would have had in an
+        uninterrupted run. For the legacy flat ramp this is a no-op (preserving
+        prior resume behavior)."""
+        if self._weight_schedule is None:
+            return
+        self._epoch_count = int(epoch)
+        self._set_weights(
+            weight_schedule_lib.state_after(
+                self._weight_schedule, self._init_weights, epoch, self.data_weight_floor
+            )
+        )
 
     def compute_losses(self, pred, true, inputs):
         "Compute weighted loss and dictionary"
@@ -159,6 +226,16 @@ class LossMHD_PhysicsNeMo(object):
             loss_dict["loss_p"] = loss_p
             loss_dict["loss_e3"] = loss_e3
             loss_dict["loss_rho"] = loss_rho
+            # Full-coverage diagnostic: native-resolution data loss over ALL
+            # timesteps (no spatial coarsening, no temporal stride). This is the
+            # only metric that compares the *entire* domain of pred to true, so
+            # it is directly comparable across coarse/stride configs — unlike
+            # loss_data (penalized subset) or loss_data_highres/_skipped, which
+            # are relative norms over disjoint subsets and cannot be recombined.
+            # Logging-only (@torch.no_grad on _data_loss_full_on).
+            loss_dict["loss_data_full"] = self._data_loss_full_on(
+                pred, true, slice(None)
+            )
             # Track full-res loss on skipped (non-penalized) timesteps
             loss_data_skipped = self.skipped_data_loss(pred, true)
             if loss_data_skipped is not None:
@@ -175,21 +252,26 @@ class LossMHD_PhysicsNeMo(object):
                 )
         else:
             loss_data = 0
+        # IC
+        # ! Unused, non-adjusted PhysicsNeMo carry-over -- see ic_loss() below.
+        if self.use_ic_loss:
+            loss_ic, loss_u_ic, loss_v_ic, loss_Bx_ic, loss_By_ic = self.ic_loss(
+                pred, inputs, return_all_losses=True
+            )
+            loss_dict["loss_ic"] = loss_ic
+            loss_dict["loss_u_ic"] = loss_u_ic
+            loss_dict["loss_v_ic"] = loss_v_ic
+            loss_dict["loss_Bx_ic"] = loss_Bx_ic
+            loss_dict["loss_By_ic"] = loss_By_ic
+        else:
+            loss_ic = 0
 
         # PDE
         if self.use_pde_loss:
             eta = inputs[..., -1] # take eta from the inputs
             FI1, FI2, MO, ES0, ES1, ES2, C1 = self.mhd_pde(u1, u2, b1, b2, p, e3, rho, eta)
-            # Apply physics stride: compute loss only on strided timesteps
-            s = self.physics_loss_stride
-            if s > 1:
-                FI1_s, FI2_s, MO_s = FI1[:, ::s], FI2[:, ::s], MO[:, ::s]
-                ES0_s, ES1_s, ES2_s, C1_s = ES0[:, ::s], ES1[:, ::s], ES2[:, ::s], C1[:, ::s]
-            else:
-                FI1_s, FI2_s, MO_s = FI1, FI2, MO
-                ES0_s, ES1_s, ES2_s, C1_s = ES0, ES1, ES2, C1
             loss_pde, loss_FI1, loss_FI2, loss_MO, loss_ES0, loss_ES1, loss_ES2, loss_C1 = self.mhd_pde_loss(
-                FI1_s, FI2_s, MO_s, ES0_s, ES1_s, ES2_s, C1_s, return_all_losses=True
+                FI1, FI2, MO, ES0, ES1, ES2, C1, return_all_losses=True
             )
             loss_dict["loss_pde"] = loss_pde
             loss_dict["loss_FI1"] = loss_FI1
@@ -199,41 +281,24 @@ class LossMHD_PhysicsNeMo(object):
             loss_dict["loss_ES1"] = loss_ES1
             loss_dict["loss_ES2"] = loss_ES2
             loss_dict["loss_C1"] = loss_C1
-            # Track loss on skipped (non-penalized) physics timesteps
-            if s > 1:
-                loss_pde_skipped = self._skipped_physics_loss(
-                    FI1, FI2, MO, ES0, ES1, ES2, C1
-                )
-                if loss_pde_skipped is not None:
-                    loss_dict["loss_pde_skipped"] = loss_pde_skipped
         else:
             loss_pde = 0
 
         # Constraints
         if self.use_constraint_loss:
             div_B = self.mhd_constraint(b1, b2)
-            # Apply same physics stride
-            s = self.physics_loss_stride
-            if s > 1:
-                div_B_s = div_B[:, ::s]
-            else:
-                div_B_s = div_B
             loss_constraint, loss_div_B = self.mhd_constraint_loss(
-                div_B_s, return_all_losses=True
+                div_B, return_all_losses=True
             )
             loss_dict["loss_constraint"] = loss_constraint
             loss_dict["loss_div_B"] = loss_div_B
-            # Track loss on skipped constraint timesteps
-            if s > 1:
-                loss_constraint_skipped = self._skipped_constraint_loss(div_B)
-                if loss_constraint_skipped is not None:
-                    loss_dict["loss_constraint_skipped"] = loss_constraint_skipped
         else:
             loss_constraint = 0
 
         if self.use_weighted_mean:
             weight_sum = (
                 self.data_weight
+                + self.ic_weight
                 + self.pde_weight
                 + self.constraint_weight
             )
@@ -242,6 +307,7 @@ class LossMHD_PhysicsNeMo(object):
 
         loss = (
             self.data_weight * loss_data
+            + self.ic_weight * loss_ic
             + self.pde_weight * loss_pde
             + self.constraint_weight * loss_constraint
         ) / weight_sum
@@ -320,36 +386,50 @@ class LossMHD_PhysicsNeMo(object):
             return None
         return self._data_loss_full_on(pred, true, skipped_indices)
 
-    @torch.no_grad()
-    def _skipped_physics_loss(self, FI1, FI2, MO, ES0, ES1, ES2, C1):
-        "Compute PDE loss on skipped (non-penalized) timesteps for tracking only"
-        s = self.physics_loss_stride
-        if s <= 1:
-            return None
-        nt = FI1.shape[1]
-        all_idx = set(range(nt))
-        strided_idx = set(range(0, nt, s))
-        skipped = sorted(all_idx - strided_idx)
-        if not skipped:
-            return None
-        return self.mhd_pde_loss(
-            FI1[:, skipped], FI2[:, skipped], MO[:, skipped],
-            ES0[:, skipped], ES1[:, skipped], ES2[:, skipped], C1[:, skipped],
-        )
+    def ic_loss(self, pred, inputs, return_all_losses=False):
+        "Compute initial condition loss"
+        # ! Non-adjusted carry-over from the original PhysicsNeMo example: this
+        # ! path was never used for BHAC-MHD (every config sets use_ic_loss:
+        # ! False) and would raise as-is -- it refers to self.u_weight/v_weight/
+        # ! Bx_weight/By_weight (the constructor defines u1_weight...), the input
+        # ! slice below assumes 4 channels, and line ~411 has a `x = x =` typo.
+        # ! Kept for reference; can probably be made functional with small edits.
+        lploss = LpLoss(size_average=True)
+        ic_pred = pred[:, 0]
+        ic_true = inputs[:, 0, ..., 3:]
+        u_ic_pred = ic_pred[..., 0]
+        v_ic_pred = ic_pred[..., 1]
+        Bx_ic_pred = ic_pred[..., 2]
+        By_ic_pred = ic_pred[..., 3]
 
-    @torch.no_grad()
-    def _skipped_constraint_loss(self, div_B):
-        "Compute constraint loss on skipped (non-penalized) timesteps for tracking only"
-        s = self.physics_loss_stride
-        if s <= 1:
-            return None
-        nt = div_B.shape[1]
-        all_idx = set(range(nt))
-        strided_idx = set(range(0, nt, s))
-        skipped = sorted(all_idx - strided_idx)
-        if not skipped:
-            return None
-        return self.mhd_constraint_loss(div_B[:, skipped])
+        u_ic_true = ic_true[..., 0]
+        v_ic_true = ic_true[..., 1]
+        Bx_ic_true = ic_true[..., 2]
+        By_ic_true = ic_true[..., 3]
+
+        loss_u_ic = lploss(u_ic_pred, u_ic_true)
+        loss_v_ic = lploss(v_ic_pred, v_ic_true)
+        loss_Bx_ic = lploss(Bx_ic_pred, Bx_ic_true)
+        loss_By_ic = lploss(By_ic_pred, By_ic_true)
+
+        if self.use_weighted_mean:
+            weight_sum = weight_sum = (
+                self.u_weight + self.v_weight + self.Bx_weight + self.By_weight
+            )
+        else:
+            weight_sum = 1.0
+
+        loss_ic = (
+            self.u_weight * loss_u_ic
+            + self.v_weight * loss_v_ic
+            + self.Bx_weight * loss_Bx_ic
+            + self.By_weight * loss_By_ic
+        ) / weight_sum
+
+        if return_all_losses:
+            return loss_ic, loss_u_ic, loss_v_ic, loss_Bx_ic, loss_By_ic
+        else:
+            return loss_ic
 
     def mhd_pde_loss(self, FI1, FI2, MO, ES0, ES1, ES2, C1, return_all_losses=None):
         "Compute PDE loss"
@@ -419,9 +499,9 @@ class LossMHD_PhysicsNeMo(object):
     def mhd_constraint(self, b1, b2):
         "Compute constraints"
         # pred shape: (batch, nt, nx, ny, nfields)
-        nt = b1.size(1)
-        nx = b1.size(2)
-        ny = b1.size(3)
+        nt = b1.size(1)        # number of time frames per sample
+        nx = b1.size(2)        # spatial resolution in x
+        ny = b1.size(3)        # spatial resolution in y
         if self.diff_type == 'fourier':
             f_db1 = fourier_derivatives(b1, [self.Lx, self.Ly])
             f_db2 = fourier_derivatives(b2, [self.Lx, self.Ly])
@@ -443,6 +523,9 @@ class LossMHD_PhysicsNeMo(object):
         nx = b1.size(2)
         ny = b1.size(3)
         dt = self.tend / (nt - 1)
+        dx = self.Lx / nx
+        dy = self.Ly / ny
+
         if self.diff_type == 'fourier':
         # compute fourier derivatives
             f_du1 = fourier_derivatives(u1, [self.Lx, self.Ly])
@@ -486,8 +569,9 @@ class LossMHD_PhysicsNeMo(object):
         b2_t = self.Du_t(b2, dt)
         p_t = self.Du_t(p, dt)
         e3_t = self.Du_t(e3, dt)
-        rho_t = self.Du_t(rho, dt)
+        rho_t= self.Du_t(rho, dt)
 
+        # Plug inputs into dictionary
         all_inputs = {
             "u1": u1,
             "u2": u2,
@@ -518,12 +602,17 @@ class LossMHD_PhysicsNeMo(object):
             "rho__y": rho_y,
             "rho__t": rho_t,
         }
-
         # Evaluate equations
 
         # Faraday Induction I & II
-        FI1 = self.mhd_pde_node[1].evaluate({"b1__t": b1_t, "e3__y": e3_y})["FI1"]
-        FI2 = self.mhd_pde_node[2].evaluate({"b2__t": b2_t, "e3__x": e3_x})["FI2"]
+        FI1 = self.mhd_pde_node[1].evaluate({"b1__t": b1_t, "e3__y": e3_y})[
+            "FI1"
+        ]
+        # "e3__y": e3_y[:, 1:-1]
+        FI2 = self.mhd_pde_node[2].evaluate({"b2__t": b2_t, "e3__x": e3_x})[
+            "FI2"
+        ]
+        # "e3__x": e3_x[:, 1:-1]
 
         # Gauss, Maxwell, Ohm
         MO = self.mhd_pde_node[3].evaluate({
@@ -535,8 +624,9 @@ class LossMHD_PhysicsNeMo(object):
             "eta": eta,
             "b1__y": b1_y,
             "b2__x": b2_x,
-            "e3__t": e3_t,
+            "e3__t":e3_t
         })["MO"]
+        #for central differencing: "e3__x": e3_x[:, 1:-1]
 
         # EoS
         ES0 = self.mhd_pde_node[4].evaluate(all_inputs)["ES0"]
@@ -560,6 +650,15 @@ class LossMHD_PhysicsNeMo(object):
 
         return FI1, FI2, MO, ES0, ES1, ES2, C1
 
+    '''
+    # central differencing
+    # leaves out first and last timestep
+    def Du_t(self, u, dt):
+        "Compute time derivative"
+        u_t = (u[:, 2:] - u[:, :-2]) / (2 * dt)
+        return u_t
+    '''
+    # includes first and last timestep
     def Du_t(self, u, dt):
         "Time derivative with boundary support (shape preserved)"
         u_t = torch.empty_like(u)

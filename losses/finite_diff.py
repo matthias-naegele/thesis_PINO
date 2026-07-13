@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 Matthias Nägele.
-# SPDX-License-Identifier: Apache-2.0
-
 import torch
 
 

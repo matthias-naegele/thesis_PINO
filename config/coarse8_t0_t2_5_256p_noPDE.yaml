@@ -1,0 +1,39 @@
+# ============================================================================
+# noPDE control for coarse8_t0_t2_5_256p: the same run, but the physics
+# losses are NEVER switched on — pure data loss for all 600 epochs.
+#
+# This is a small overlay: the Hydra defaults list below pulls in the parent
+# config wholesale (model, dataset, optimizer, wandb project, paths.yaml),
+# and only what defines the control is overridden here. The weight schedule
+# collapses to a single ramp-free 600-epoch phase (data_weight stays 1,
+# pde/constraint stay 0), and use_pde_loss / use_constraint_loss are switched
+# off so the PDE-residual and div-B terms are not even computed.
+#
+# Same seed as the parent, so the first 100 epochs replicate the parent's
+# data-only warm-up; from there this run shows where pure data training goes
+# instead of the physics ramp.
+#
+# Launched by launchers_noPDE/run_coarse8_t0_t2_5_256p_noPDE.sh.
+# ============================================================================
+
+defaults:
+  - coarse8_t0_t2_5_256p  # parent run: everything not overridden
+  - _self_                      # below comes from that config
+
+loss_params:
+  # Physics off for the whole run: skip computing the PDE-residual and div-B
+  # constraint terms entirely (their weights would stay 0 anyway).
+  use_pde_loss: False
+  use_constraint_loss: False
+  # One ramp-free phase: all weights keep their starting values (data 1,
+  # pde 0, constraint 0) for the entire run. Replaces the parent's schedule.
+  weight_schedule:
+    - epochs: 600
+
+train_params:
+  epochs: 600
+  ckpt_path: ${output_root}/checkpoints/coarse8_t0_t2_5_256p_noPDE
+
+wandb_params:
+  # Same wandb project as the parent (inherited); only the group is suffixed.
+  wandb_group: coarse8_t0_t2_5_256p_noPDE

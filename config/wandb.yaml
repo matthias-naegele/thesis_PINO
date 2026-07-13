@@ -1,0 +1,18 @@
+# Wandb account — the ONE place to edit when running this project under a new
+# wandb account (the machine-paths counterpart is config/paths.yaml). Every run
+# config pulls this in via `defaults: - wandb` and interpolates the values into
+# its wandb_params block, so you should not need to touch the individual run
+# configs.
+#
+#   wandb_entity  the wandb account/team the runs are logged to
+#                 (also needs a one-time `wandb login` on the machine).
+#
+#   wandb_mode    online | offline | disabled — set `disabled` to train
+#                 without any wandb setup, or `offline` to sync later.
+#                 (`use_wandb` in each run config additionally gates the
+#                 PhysicsNeMo LaunchLogger's wandb output.)
+#
+# Per-run identity (wandb_project / wandb_group) and the plot knobs stay in the
+# individual run configs.
+wandb_entity: matthias-naegele-uni-w-rzburg
+wandb_mode:   online

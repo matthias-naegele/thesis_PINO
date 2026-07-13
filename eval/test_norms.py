@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2026 Matthias Nägele.
-# SPDX-License-Identifier: Apache-2.0
 """
 Print per-timestep and per-channel statistics for an FNO-style HDF5 file.
 

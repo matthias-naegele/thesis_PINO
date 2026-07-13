@@ -1,24 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Modifications copyright (c) 2026 Matthias Nägele.
-# Licensed under the Apache License, Version 2.0.
 
 """Compute BHAC data/PDE/divB losses directly on ground-truth data.
 
-No model is run. BHAC batches are loaded from the configured dataloader and used
-both as "prediction" and as "truth" so that:
-  - the data loss should be ~0,
-  - the PDE residual losses report the discretisation error of the simulation,
-  - the divB constraint loss reports the constraint violation in the data,
-  - the eta value is summarised per batch when batch_size == 1.
+This script does not run a model. It loads BHAC batches from the configured dataloader,
+then evaluates:
+  - data loss on (outputs vs outputs), expected ~0
+  - PDE residual losses on the same outputs (treated as prediction)
+  - divB constraint loss on the same outputs
+  - eta value summary for each batch when batch_size == 1
 
 Example:
-  python check_bhac_losses.py --split train --num-batches 5
+  python check_bbhac_losses.py --split train --num-batches 5
 """
 
 import argparse
+import os
 from typing import Optional
 
 import torch
@@ -34,7 +32,7 @@ def parse_args():
         "--config",
         type=str,
         default="config/mhd_bhac.yaml",
-        help="Path to YAML config.",
+        help="Path to YAML config (relative to the repository root).",
     )
     parser.add_argument(
         "--split",
@@ -102,6 +100,13 @@ def build_dataloader(cfg, split: str, batch_size_override: Optional[int]):
 def main():
     args = parse_args()
     cfg = OmegaConf.load(args.config)
+    # Run configs derive their paths from a sibling paths.yaml via Hydra's
+    # `defaults` list; OmegaConf.load doesn't process that, so compose the
+    # sibling paths.yaml (config/ or a checkpoint snapshot dir) when present so
+    # ${data_root}/${output_root} resolve. Harmless for already-literal configs.
+    paths_yaml = os.path.join(os.path.dirname(args.config), "paths.yaml")
+    if os.path.isfile(paths_yaml):
+        cfg = OmegaConf.merge(OmegaConf.load(paths_yaml), cfg)
 
     dataloader, batch_size = build_dataloader(cfg, args.split, args.batch_size)
     loss_fn = LossMHD_PhysicsNeMo(**cfg.loss_params)

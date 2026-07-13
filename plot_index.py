@@ -1,5 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 Matthias Nägele.
-# SPDX-License-Identifier: Apache-2.0
 """
 Plot fields (e.g. b2, e3, rho) on validation data at specified timesteps.
 
@@ -13,12 +11,20 @@ Features:
   - Color scale mode via --scale: global (shared across timesteps) or local (per-timestep)
   - L2 norm of true vs pred shown in slice plot titles
   - Multiple epochs via --epoch (e.g. --epoch 100 200); adds epoch_NNNN/ subdir
+  - Scale-independent raw-data dumps: one consolidated fields.h5 per (sample,
+    field/Jz) holding all timesteps + the data-loss masks, plus a .txt table per
+    slice (B^2-plotter style, with an is_data_point column). These let a PNG be
+    re-rendered at any colour scale and tell which pixels/slice points the data
+    loss supervised. Written to --data_dir (default: --output_dir) so the
+    global/local colour-scale jobs can share ONE copy instead of duplicating it;
+    --skip_data_files suppresses them (used by the index_local job).
 
 scale: local or global
 
 Usage:
     python plot_index.py --field b2 e3 --time_index -1 --modes true pred error \\
-        --slice_y 64 127 --slice_x 64 127 --epoch 100 200 --plot_jz --scale local --output_dir ./index_plots
+        --slice_y 64 127 --slice_x 64 127 --epoch 100 200 --plot_jz --scale local \\
+        --output_dir ./index_plots --data_dir ./index_data
 """
 
 import argparse
@@ -28,6 +34,7 @@ from omegaconf import DictConfig, OmegaConf
 import torch
 import os
 import numpy as np
+import h5py
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
@@ -141,6 +148,35 @@ def save_field_2d(data, X, Y, title, save_path, cmap="jet", norm=None):
     plt.close(fig)
 
 
+def save_field_2d_strided(full_data, X, Y, coarse_factor, title, save_path,
+                          cmap="jet", norm=None, bad_color="0.6"):
+    """Save a full-resolution field showing ONLY every ``coarse_factor``-th pixel.
+
+    Unlike the downsampled "smooth" low-res view (which collapses the field to an
+    (N/cf)^2 image and can read like a blurred picture), this keeps the original
+    NxN grid and colours only the pixels at ``[::cf, ::cf]`` — exactly the points
+    the coarse data loss supervises — while every other pixel is rendered in a
+    flat gray. It makes the *striding* of the coarse data loss explicit.
+    """
+    masked = np.ma.masked_all(full_data.shape, dtype=full_data.dtype)
+    masked[::coarse_factor, ::coarse_factor] = full_data[::coarse_factor, ::coarse_factor]
+
+    cmap_obj = mpl.colormaps[cmap].copy()
+    cmap_obj.set_bad(bad_color)
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    ax.set_facecolor(bad_color)
+    pcm = ax.pcolormesh(X, Y, masked, cmap=cmap_obj, shading="nearest", norm=norm)
+    plt.colorbar(pcm, ax=ax)
+    ax.set_title(title)
+    ax.set_xlabel(r"$x$")
+    ax.set_ylabel(r"$y$")
+    ax.set_aspect("equal")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)
+
+
 def save_slice_1d(x_coords, slices_dict, title, save_path, xlabel=r"$x$",
                    l2_norm=None, marker_x=None, marker_vals=None,
                    marker_label="Data supervision"):
@@ -185,6 +221,83 @@ def save_slice_1d(x_coords, slices_dict, title, save_path, xlabel=r"$x$",
     plt.close(fig)
 
 
+# --------------------------------------------------------------------------
+# Scale-independent raw-data dumps (.h5 fields + .txt slices)
+#
+# The PNGs differ between the global- and local-scale variants only by their
+# colour normalisation; the underlying numbers are identical.  These dumps hold
+# the raw arrays so a PNG can be re-rendered at any scale, and they carry the
+# data-loss mask so one can tell which pixels/timesteps/slice points the data
+# loss actually supervised (conceptually the same marker as in the B^2 plotter).
+# They are written ONCE (by the index_global job) into a shared directory rather
+# than duplicated per colour-scale variant.
+# --------------------------------------------------------------------------
+
+def _slice_data_mask(n, coarse_factor, supervised_in_time):
+    """1 where the (coarse) data loss supervises a slice point, else 0.
+
+    A point ``i`` along a slice is supervised iff the timestep is supervised by
+    the time stride AND ``i`` lies on the coarse grid (``i % coarse_factor == 0``).
+    This mirrors the red marker dots drawn on the slice PNGs.
+    """
+    m = np.zeros(n, dtype=np.uint8)
+    if supervised_in_time:
+        m[::coarse_factor] = 1
+    return m
+
+
+def save_slice_txt(coords, slices_dict, save_path, is_data_point=None,
+                   coord_label="x", header_lines=None):
+    """Write the raw 1-D slice data as a text table (B^2-plotter style).
+
+    Columns: ``coord_label``, one column per mode in ``slices_dict`` (in order),
+    and optionally ``is_data_point`` (1 where the data loss supervises this
+    point, else 0).  ``header_lines`` are written as leading ``# ...`` comments.
+    """
+    modes = list(slices_dict.keys())
+    with open(save_path, "w") as f:
+        for h in (header_lines or []):
+            f.write(f"# {h}\n")
+        cols = [coord_label] + modes + (["is_data_point"] if is_data_point is not None else [])
+        f.write("# columns: " + "  ".join(cols) + "\n")
+        for i in range(len(coords)):
+            row = [f"{float(coords[i]):.8e}"]
+            row += [f"{float(slices_dict[m][i]):.8e}" for m in modes]
+            if is_data_point is not None:
+                row.append(str(int(is_data_point[i])))
+            f.write("\t".join(row) + "\n")
+
+
+def write_fields_h5(save_path, x, y, t, fields_by_mode, coarse_factor,
+                    data_loss_stride, attrs, ic_field=None):
+    """Dump the scale-independent raw 2-D data for one (sample, field/quantity).
+
+    Stores every timestep of the provided modes (e.g. true/pred/error) plus the
+    optional IC, the grid coordinates, the real time axis, and the data-loss
+    masks.  ``data_mask_spatial`` (nx, ny) marks the pixels at ``[::cf, ::cf]``
+    that the coarse data loss supervises; ``data_mask_time`` (nt,) marks the
+    timesteps at ``[::stride]`` it supervises in time.
+    """
+    any_field = next(iter(fields_by_mode.values()))
+    nt, nx, ny = any_field.shape
+    data_mask_spatial = np.zeros((nx, ny), dtype=np.uint8)
+    data_mask_spatial[::coarse_factor, ::coarse_factor] = 1
+    data_mask_time = np.zeros(nt, dtype=np.uint8)
+    data_mask_time[::data_loss_stride] = 1
+    with h5py.File(save_path, "w") as f:
+        f.create_dataset("x", data=np.asarray(x))
+        f.create_dataset("y", data=np.asarray(y))
+        f.create_dataset("t", data=np.asarray(t))
+        for mode, arr in fields_by_mode.items():
+            f.create_dataset(mode, data=np.asarray(arr))
+        if ic_field is not None:
+            f.create_dataset("ic", data=np.asarray(ic_field))
+        f.create_dataset("data_mask_spatial", data=data_mask_spatial)
+        f.create_dataset("data_mask_time", data=data_mask_time)
+        for k, v in attrs.items():
+            f.attrs[k] = v
+
+
 # ---- CLI parsing (before Hydra) ----
 def parse_extra_args():
     parser = argparse.ArgumentParser(add_help=False)
@@ -206,9 +319,30 @@ def parse_extra_args():
                         help="Checkpoint epoch(s) to load (e.g. --epoch 100 200); "
                              "omit for latest")
     parser.add_argument("--output_dir", type=str, default="./index_plots")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Root for the scale-independent raw data (.h5 fields "
+                             "+ .txt slices). Defaults to --output_dir. Lets the "
+                             "index_global / index_local jobs share ONE copy of "
+                             "the data instead of duplicating it per colour scale.")
+    parser.add_argument("--skip_data_files", action="store_true",
+                        help="Do not write the .h5/.txt raw-data files (only render "
+                             "PNGs). Used by the index_local job so the "
+                             "scale-independent data is written once by index_global.")
+    parser.add_argument("--no_epoch_subdir", action="store_true",
+                        help="Do not add an epoch_NNNN/ subdirectory under the output "
+                             "and data dirs. Use when the caller already places the "
+                             "output under an epoch-specific directory.")
     parser.add_argument("--plot_jz", action="store_true",
                         help="Also plot Jz = de3/dt - db2/dx + db1/dy "
                              "using the diff_type from the config")
+    parser.add_argument("--lowres_style", type=str, default="smooth",
+                        choices=["smooth", "gray"],
+                        help="How to render the low-res (data_loss_coarse_factor>1) "
+                             "field plots: 'smooth' = the downsampled (N/cf)^2 image "
+                             "(true/pred/error); 'gray' = keep the full NxN grid but "
+                             "show ONLY every cf-th DATA pixel (the points the coarse "
+                             "data loss supervises), greying out the rest. 'gray' plots "
+                             "the BHAC data only.")
     known, remaining = parser.parse_known_args()
     sys.argv = [sys.argv[0]] + remaining
     return known
@@ -237,13 +371,21 @@ def main(cfg: DictConfig) -> None:
     slice_xs = ARGS.slice_x or []
     scale_mode = ARGS.scale
     plot_jz = ARGS.plot_jz
+    lowres_style = ARGS.lowres_style
     output_dir = os.path.abspath(ARGS.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
+    # data_root: where the scale-independent .h5/.txt land. Defaults to the PNG
+    # output_dir (self-contained standalone runs); the orchestrated jobs point it
+    # at a shared index_data/ dir so global+local don't duplicate the raw data.
+    data_root = os.path.abspath(ARGS.data_dir) if ARGS.data_dir else output_dir
+    write_data = not ARGS.skip_data_files
+
     # epoch_list: list of ints to load, or [None] meaning "latest"
-    # use_epoch_subdir: add epoch_NNNN/ layer when epochs are explicitly specified
+    # use_epoch_subdir: add epoch_NNNN/ layer when epochs are explicitly specified,
+    # unless the caller already nests by epoch (--no_epoch_subdir).
     epoch_list = ARGS.epoch if ARGS.epoch else [None]
-    use_epoch_subdir = bool(ARGS.epoch)
+    use_epoch_subdir = bool(ARGS.epoch) and not ARGS.no_epoch_subdir
 
     model_params = cfg.model_params
     dataset_params = cfg.dataset_params
@@ -320,6 +462,10 @@ def main(cfg: DictConfig) -> None:
     if slice_xs:
         print(f"Slice at pixel x={slice_xs}")
     print(f"Output: {output_dir}")
+    if write_data:
+        print(f"Raw data dir: {data_root}")
+    else:
+        print("Raw data: skipped (--skip_data_files)")
 
     label_for_mode = {"true": "BHAC", "pred": "FNO", "error": "Error"}
 
@@ -334,9 +480,11 @@ def main(cfg: DictConfig) -> None:
 
         if use_epoch_subdir:
             epoch_dir = os.path.join(output_dir, f"epoch_{loaded_epoch:04d}")
-            os.makedirs(epoch_dir, exist_ok=True)
+            data_epoch_dir = os.path.join(data_root, f"epoch_{loaded_epoch:04d}")
         else:
             epoch_dir = output_dir
+            data_epoch_dir = data_root
+        os.makedirs(epoch_dir, exist_ok=True)
 
         with torch.no_grad():
             for sample_idx, (inputs, outputs) in enumerate(dataloader_val):
@@ -397,6 +545,31 @@ def main(cfg: DictConfig) -> None:
                         slice_dir = os.path.join(sample_dir, "slices")
                         os.makedirs(slice_dir, exist_ok=True)
 
+                    # Shared scale-independent raw data for this (sample, field):
+                    # one consolidated fields.h5 (all timesteps + data-loss masks)
+                    # plus per-slice .txt tables. Written once (index_global).
+                    data_field_dir = os.path.join(
+                        data_epoch_dir, f"sample_{sample_idx:03d}", field_name)
+                    data_slice_dir = os.path.join(data_field_dir, "slices")
+                    if write_data:
+                        os.makedirs(data_field_dir, exist_ok=True)
+                        write_fields_h5(
+                            os.path.join(data_field_dir, "fields.h5"),
+                            x, y, np.asarray(t_real)[:true_field.shape[0]],
+                            {"true": true_field, "pred": pred_field, "error": err_field},
+                            coarse_factor, data_loss_stride,
+                            attrs={
+                                "eta": eta_val, "epoch": loaded_epoch,
+                                "sample": sample_idx, "field": field_name,
+                                "coarse_factor": coarse_factor,
+                                "data_loss_stride": data_loss_stride,
+                                "Lx": Lx, "Ly": Ly,
+                            },
+                            ic_field=ic_field,
+                        )
+                        if slice_ys or slice_xs:
+                            os.makedirs(data_slice_dir, exist_ok=True)
+
                     # --- IC plots (only once, independent of timestep) ---
                     if "ic" in modes:
                         save_field_2d(
@@ -405,12 +578,25 @@ def main(cfg: DictConfig) -> None:
                             save_path=os.path.join(sample_dir, "ic.png"),
                             norm=global_val_norm,
                         )
+                        ic_hdr = lambda axis, pos: [
+                            f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                            f"sample = {sample_idx}", f"field = {field_name}",
+                            f"slice = {axis}={pos}", "t = initial_condition",
+                            f"coarse_factor = {coarse_factor}",
+                            f"data_loss_stride = {data_loss_stride}",
+                        ]
                         for sy in slice_ys:
                             save_slice_1d(
                                 x, {"ic": ic_field[:, sy]},
                                 title=f"{eta_str}, {field_label}",
                                 save_path=os.path.join(slice_dir, f"ic_slice_y{sy}.png"),
                             )
+                            if write_data:
+                                save_slice_txt(
+                                    x, {"ic": ic_field[:, sy]},
+                                    os.path.join(data_slice_dir, f"ic_slice_y{sy}.txt"),
+                                    is_data_point=_slice_data_mask(len(x), coarse_factor, True),
+                                    coord_label="x", header_lines=ic_hdr("y_index", sy))
                         for sx in slice_xs:
                             save_slice_1d(
                                 y, {"ic": ic_field[sx, :]},
@@ -418,6 +604,12 @@ def main(cfg: DictConfig) -> None:
                                 save_path=os.path.join(slice_dir, f"ic_slice_x{sx}.png"),
                                 xlabel=r"$y$",
                             )
+                            if write_data:
+                                save_slice_txt(
+                                    y, {"ic": ic_field[sx, :]},
+                                    os.path.join(data_slice_dir, f"ic_slice_x{sx}.txt"),
+                                    is_data_point=_slice_data_mask(len(y), coarse_factor, True),
+                                    coord_label="y", header_lines=ic_hdr("x_index", sx))
                         print(f"  sample {sample_idx:03d} [{field_name}]: IC saved")
 
                     # --- Timestep plots ---
@@ -477,6 +669,19 @@ def main(cfg: DictConfig) -> None:
                                 save_path=os.path.join(slice_dir, f"t{ti:03d}_slice_y{sy}.png"),
                                 l2_norm=l2,
                             )
+                            if write_data:
+                                save_slice_txt(
+                                    x, slices,
+                                    os.path.join(data_slice_dir, f"t{ti:03d}_slice_y{sy}.txt"),
+                                    is_data_point=_slice_data_mask(
+                                        len(x), coarse_factor, ti % data_loss_stride == 0),
+                                    coord_label="x", header_lines=[
+                                        f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                        f"sample = {sample_idx}", f"field = {field_name}",
+                                        f"slice = y_index={sy}, y={y_val:.6e}",
+                                        f"t = {t_val:.6e}", f"l2_true_pred = {l2:.6e}",
+                                        f"coarse_factor = {coarse_factor}",
+                                        f"data_loss_stride = {data_loss_stride}"])
 
                         for sx in slice_xs:
                             x_val = x[sx]
@@ -497,6 +702,19 @@ def main(cfg: DictConfig) -> None:
                                 xlabel=r"$y$",
                                 l2_norm=l2,
                             )
+                            if write_data:
+                                save_slice_txt(
+                                    y, slices,
+                                    os.path.join(data_slice_dir, f"t{ti:03d}_slice_x{sx}.txt"),
+                                    is_data_point=_slice_data_mask(
+                                        len(y), coarse_factor, ti % data_loss_stride == 0),
+                                    coord_label="y", header_lines=[
+                                        f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                        f"sample = {sample_idx}", f"field = {field_name}",
+                                        f"slice = x_index={sx}, x={x_val:.6e}",
+                                        f"t = {t_val:.6e}", f"l2_true_pred = {l2:.6e}",
+                                        f"coarse_factor = {coarse_factor}",
+                                        f"data_loss_stride = {data_loss_stride}"])
 
                         print(f"  sample {sample_idx:03d} [{field_name}]: t={ti} saved")
 
@@ -535,9 +753,13 @@ def main(cfg: DictConfig) -> None:
                             j = max(0, min(j, j_max))
                             return j * k
 
-                        if slice_ys or slice_xs:
+                        data_slice_dir_lr = os.path.join(
+                            data_field_dir + "_lowres", "slices")
+                        if (slice_ys or slice_xs):
                             slice_dir_lr = os.path.join(sample_dir_lr, "slices")
                             os.makedirs(slice_dir_lr, exist_ok=True)
+                            if write_data:
+                                os.makedirs(data_slice_dir_lr, exist_ok=True)
 
                         # IC standalone slices at snapped coarse-grid positions
                         # (no FNO/BHAC curve here -> no red dots)
@@ -551,6 +773,18 @@ def main(cfg: DictConfig) -> None:
                                     save_path=os.path.join(
                                         slice_dir_lr, f"ic_slice_y{sy_eff}.png"),
                                 )
+                                if write_data:
+                                    save_slice_txt(
+                                        x, {"ic": ic_field[:, sy_eff]},
+                                        os.path.join(data_slice_dir_lr, f"ic_slice_y{sy_eff}.txt"),
+                                        is_data_point=_slice_data_mask(len(x), coarse_factor, True),
+                                        coord_label="x", header_lines=[
+                                            f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                            f"sample = {sample_idx}", f"field = {field_name}",
+                                            f"slice = y_index={sy_eff}, y={y_val:.6e}",
+                                            "t = initial_condition",
+                                            f"coarse_factor = {coarse_factor}",
+                                            f"data_loss_stride = {data_loss_stride}"])
                             for sx in slice_xs:
                                 sx_eff = _snap_to_coarse(sx, coarse_factor, Nx_full)
                                 x_val = x[sx_eff]
@@ -561,6 +795,18 @@ def main(cfg: DictConfig) -> None:
                                         slice_dir_lr, f"ic_slice_x{sx_eff}.png"),
                                     xlabel=r"$y$",
                                 )
+                                if write_data:
+                                    save_slice_txt(
+                                        y, {"ic": ic_field[sx_eff, :]},
+                                        os.path.join(data_slice_dir_lr, f"ic_slice_x{sx_eff}.txt"),
+                                        is_data_point=_slice_data_mask(len(y), coarse_factor, True),
+                                        coord_label="y", header_lines=[
+                                            f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                            f"sample = {sample_idx}", f"field = {field_name}",
+                                            f"slice = x_index={sx_eff}, x={x_val:.6e}",
+                                            "t = initial_condition",
+                                            f"coarse_factor = {coarse_factor}",
+                                            f"data_loss_stride = {data_loss_stride}"])
 
                         for ti in t_indices:
                             t_val = float(t_real[ti])
@@ -588,17 +834,37 @@ def main(cfg: DictConfig) -> None:
                                 "error": err_norm_lr,
                             }
 
-                            for mode in modes:
-                                if mode == "ic":
-                                    continue
-                                save_field_2d(
-                                    data_for_mode_lr[mode], X_lr, Y_lr,
-                                    title=(f"{eta_str}, {field_label}, {label_for_mode[mode]}, "
+                            if lowres_style == "gray":
+                                # Full NxN grid, only every cf-th DATA pixel
+                                # coloured (the supervised points), rest gray.
+                                # Data (BHAC) only \u2014 predictions are not strided.
+                                if scale_mode == "global":
+                                    gray_norm = global_val_norm
+                                else:
+                                    gray_norm = Normalize(
+                                        vmin=float(true_field[ti].min()),
+                                        vmax=float(true_field[ti].max()))
+                                save_field_2d_strided(
+                                    true_field[ti], X, Y, coarse_factor,
+                                    title=(f"{eta_str}, {field_label}, BHAC, "
                                            f"$t={t_val:.3f}$, epoch {loaded_epoch} "
-                                           f"[low-res \u00d7{coarse_factor}]"),
-                                    save_path=os.path.join(sample_dir_lr, f"t{ti:03d}_{mode}.png"),
-                                    norm=norm_for_mode_lr[mode],
+                                           f"[data loss \u00d7{coarse_factor}, strided]"),
+                                    save_path=os.path.join(
+                                        sample_dir_lr, f"t{ti:03d}_true_strided.png"),
+                                    norm=gray_norm,
                                 )
+                            else:
+                                for mode in modes:
+                                    if mode == "ic":
+                                        continue
+                                    save_field_2d(
+                                        data_for_mode_lr[mode], X_lr, Y_lr,
+                                        title=(f"{eta_str}, {field_label}, {label_for_mode[mode]}, "
+                                               f"$t={t_val:.3f}$, epoch {loaded_epoch} "
+                                               f"[low-res \u00d7{coarse_factor}]"),
+                                        save_path=os.path.join(sample_dir_lr, f"t{ti:03d}_{mode}.png"),
+                                        norm=norm_for_mode_lr[mode],
+                                    )
 
                             # --- Full-resolution slice plots with red dots ---
                             data_for_mode_full = {
@@ -640,6 +906,18 @@ def main(cfg: DictConfig) -> None:
                                     marker_x=marker_x,
                                     marker_vals=marker_vals,
                                 )
+                                if write_data:
+                                    save_slice_txt(
+                                        x, slices,
+                                        os.path.join(data_slice_dir_lr, f"t{ti:03d}_slice_y{sy_eff}.txt"),
+                                        is_data_point=_slice_data_mask(len(x), coarse_factor, ti_supervised),
+                                        coord_label="x", header_lines=[
+                                            f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                            f"sample = {sample_idx}", f"field = {field_name}",
+                                            f"slice = y_index={sy_eff}, y={y_val:.6e}",
+                                            f"t = {t_val:.6e}", f"l2_true_pred = {l2:.6e}",
+                                            f"coarse_factor = {coarse_factor}",
+                                            f"data_loss_stride = {data_loss_stride}"])
 
                             for sx in slice_xs:
                                 sx_eff = _snap_to_coarse(sx, coarse_factor, Nx_full)
@@ -672,6 +950,18 @@ def main(cfg: DictConfig) -> None:
                                     marker_x=marker_x,
                                     marker_vals=marker_vals,
                                 )
+                                if write_data:
+                                    save_slice_txt(
+                                        y, slices,
+                                        os.path.join(data_slice_dir_lr, f"t{ti:03d}_slice_x{sx_eff}.txt"),
+                                        is_data_point=_slice_data_mask(len(y), coarse_factor, ti_supervised),
+                                        coord_label="y", header_lines=[
+                                            f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                            f"sample = {sample_idx}", f"field = {field_name}",
+                                            f"slice = x_index={sx_eff}, x={x_val:.6e}",
+                                            f"t = {t_val:.6e}", f"l2_true_pred = {l2:.6e}",
+                                            f"coarse_factor = {coarse_factor}",
+                                            f"data_loss_stride = {data_loss_stride}"])
 
                         print(f"  sample {sample_idx:03d} [{field_name}]: low-res (×{coarse_factor}) saved")
 
@@ -687,6 +977,30 @@ def main(cfg: DictConfig) -> None:
                     if slice_ys or slice_xs:
                         jz_slice_dir = os.path.join(jz_dir, "slices")
                         os.makedirs(jz_slice_dir, exist_ok=True)
+
+                    # Shared scale-independent raw Jz data. Jz is a diagnostic
+                    # derived from the (supervised) fields, so the masks flag
+                    # where the underlying fields were supervised.
+                    data_jz_dir = os.path.join(
+                        data_epoch_dir, f"sample_{sample_idx:03d}", "Jz")
+                    data_jz_slice_dir = os.path.join(data_jz_dir, "slices")
+                    if write_data:
+                        os.makedirs(data_jz_dir, exist_ok=True)
+                        write_fields_h5(
+                            os.path.join(data_jz_dir, "fields.h5"),
+                            x, y, np.asarray(t_real)[:true_jz.shape[0]],
+                            {"true": true_jz, "pred": pred_jz, "error": err_jz},
+                            coarse_factor, data_loss_stride,
+                            attrs={
+                                "eta": eta_val, "epoch": loaded_epoch,
+                                "sample": sample_idx, "field": "Jz",
+                                "coarse_factor": coarse_factor,
+                                "data_loss_stride": data_loss_stride,
+                                "Lx": Lx, "Ly": Ly, "diff_type": diff_type,
+                            },
+                        )
+                        if slice_ys or slice_xs:
+                            os.makedirs(data_jz_slice_dir, exist_ok=True)
 
                     # Global color normalization for Jz
                     global_jz_vmin = float(true_jz.min())
@@ -742,6 +1056,19 @@ def main(cfg: DictConfig) -> None:
                                 save_path=os.path.join(jz_slice_dir, f"t{ti:03d}_slice_y{sy}.png"),
                                 l2_norm=l2,
                             )
+                            if write_data:
+                                save_slice_txt(
+                                    x, slices,
+                                    os.path.join(data_jz_slice_dir, f"t{ti:03d}_slice_y{sy}.txt"),
+                                    is_data_point=_slice_data_mask(
+                                        len(x), coarse_factor, ti % data_loss_stride == 0),
+                                    coord_label="x", header_lines=[
+                                        f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                        f"sample = {sample_idx}", "field = Jz",
+                                        f"slice = y_index={sy}, y={y_val:.6e}",
+                                        f"t = {t_val:.6e}", f"l2_true_pred = {l2:.6e}",
+                                        f"coarse_factor = {coarse_factor}",
+                                        f"data_loss_stride = {data_loss_stride}"])
 
                         for sx in slice_xs:
                             x_val = x[sx]
@@ -758,12 +1085,27 @@ def main(cfg: DictConfig) -> None:
                                 xlabel=r"$y$",
                                 l2_norm=l2,
                             )
+                            if write_data:
+                                save_slice_txt(
+                                    y, slices,
+                                    os.path.join(data_jz_slice_dir, f"t{ti:03d}_slice_x{sx}.txt"),
+                                    is_data_point=_slice_data_mask(
+                                        len(y), coarse_factor, ti % data_loss_stride == 0),
+                                    coord_label="y", header_lines=[
+                                        f"eta = {eta_val:.6e}", f"epoch = {loaded_epoch}",
+                                        f"sample = {sample_idx}", "field = Jz",
+                                        f"slice = x_index={sx}, x={x_val:.6e}",
+                                        f"t = {t_val:.6e}", f"l2_true_pred = {l2:.6e}",
+                                        f"coarse_factor = {coarse_factor}",
+                                        f"data_loss_stride = {data_loss_stride}"])
 
                     print(f"  sample {sample_idx:03d}: Jz saved")
 
                 print(f"Sample {sample_idx:03d} done.")
 
     print(f"\nDone. All plots saved under {output_dir}")
+    if write_data:
+        print(f"Raw data (.h5 fields + .txt slices) saved under {data_root}")
 
 
 if __name__ == "__main__":

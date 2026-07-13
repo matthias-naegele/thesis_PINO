@@ -5,7 +5,7 @@ bhac
 /build/
 Build/
 # png
-#*.png
+*.png
 *.h5
 *.json
 *.wandb
@@ -191,10 +191,21 @@ multirun/
 # SLURM
 slurm-*.out
 sbatch_logs/
-errors/
-errorsPlot/
 
-# Plot script outputs
+# Produced figures (regenerable via plot_*.py); all PNG output lives under figs/
+figs_old/
+figs/
 b2_plots*/
-index_plots/
-plotsFields*/
+
+# sshfs mount of the HPC datagen folder (read-only, never commit)
+BHAC/data/
+
+# vendored upstream BHAC website/doxygen dump (kept locally, regenerable)
+BHAC/doc/
+
+main.tex
+
+# README figures: tracked on purpose, despite the blanket *.png/*.h5/... rules
+# above. These are hand-picked, small, and part of the documentation.
+!/assets/
+!/assets/**

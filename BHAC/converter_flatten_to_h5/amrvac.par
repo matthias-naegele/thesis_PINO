@@ -1,0 +1,85 @@
+ &testlist
+        teststr=''
+ &end
+
+ &filelist
+        primnames         = 'rho u1 u2 u3 p b1 b2 b3 e1 e2 e3 s lfac xi'
+	autoconvert       = F
+        fastIO            = T
+	saveprim          = .true.
+        nwauxio           = 3
+        filenameout       = 'output-0000/data'
+        filenameini       = 'output-0000/data'
+        filenamelog       = 'output-0000/amrvac'
+        typeparIO         = 0
+        write_xdmf        = F
+        level_io          = 1
+&end
+
+ &savelist
+        itsave(1,1)       = 0
+        itsave(1,2)       = 0
+        itsave(1,3)       = 0
+        itsave(1,5)       = 0 
+        ditsave(1)        = 1
+        dtsave(2)         = 0.125
+        dtsave(3)         = 1
+        dtsave(5)         = 0.01
+        nslices           = 0 
+        slicedir(1)       = 2
+        slicedir(2)       = 2
+        slicecoord(1)     = 1.570796327
+        slicecoord(2)     = 0.785398163 
+ &end
+
+ &stoplist
+        tmax              = 10
+        dtmin             = 1.d-6
+ &end
+
+ &methodlist
+        wnames            = 'd s1 s2 s3 tau b1 b2 b3 e1 e2 e3 Ds lfac xi'
+        typeadvance       = 'ImEx12'
+        typeinversion     = '2D1DEntropy'
+        typeinversionresis = '3DUNREntropy'
+	typefull1         = 13*'hll'
+        typelimiter1      = 13*'cada3'
+	strictgetaux      = T
+ &end
+
+ &boundlist
+        dixB  = 2
+        typeB = 14*'periodic',
+                14*'periodic',
+                14*'periodic',
+                14*'periodic'
+ &end
+
+ &amrlist
+        flags(15)         = 3
+        flags(1)          = 1
+        flags(2)          = 8
+        flags(3)          = 11
+        wflags(1)         = 0.4
+        wflags(2)         = 0.3
+        wflags(3)         = 0.3
+        prolongprimitive  = T
+        coarsenprimitive  = T
+	errorestimate     = 3
+        mxnest            = 5
+        tol               = 0.2d0
+        nxlone1           = 256
+        nxlone2           = 256 
+        xprobmin1         = 0.0d0
+        xprobmax1         = 6.2831853072d0
+        xprobmin2         = 0.0d0
+        xprobmax2         = 6.2831853072d0
+ &end
+
+ &paramlist
+       courantpar         = 0.3d0
+ &end
+
+&usrlist
+  eta0 = 5e-05
+/

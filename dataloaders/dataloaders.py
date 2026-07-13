@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Modifications copyright (c) 2026 Matthias Nägele.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,7 +15,10 @@
 # limitations under the License.
 
 import torch
+import numpy as np
 from torch.utils.data import DataLoader, Dataset
+import os
+import glob
 import h5py
 
 
@@ -46,7 +48,7 @@ class BHACDataloader(Dataset):
         t, x, y = dataset.get_coords(0)
         self.x = x[:ind_x:sub_x]
         self.y = y[:ind_x:sub_x]
-        # Shift the time axis so that the first kept frame becomes t=0.
+        # Use the selected start frame as the new t=0 for the model
         t_sel = t[ind_t_start:ind_t:sub_t]
         self.t = t_sel - t_sel[0]
         self.t_real = t_sel  # un-shifted, physical time values

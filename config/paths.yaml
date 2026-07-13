@@ -1,0 +1,20 @@
+# Machine paths — the ONE place to edit when moving this project to a new
+# machine or user account. Every run config pulls this in via `defaults: - paths`
+# and derives its output_dir / ckpt_path / wandb_dir / data_dir from the two
+# roots below, so you should not need to touch the individual run configs.
+#
+#   data_root   parent directory holding the BHAC data variants
+#               (finished, finished_512, ...). Each run config appends its own
+#               variant leaf, e.g.  data_dir: ${data_root}/finished_512
+#
+#   output_root parent for all training output. Each run derives
+#                 output_dir = ${output_root}
+#                 ckpt_path  = ${output_root}/checkpoints/<config-name>
+#                 wandb_dir  = ${output_root}/wandb
+#
+# The run launchers snapshot a fully RESOLVED copy of the composed config into
+# the checkpoint dir, so the plotters keep reading a single self-contained
+# <ckpt>/config.yaml with literal paths (the resolved roots are also kept inside
+# it as data_root/output_root keys, so this file need not be copied alongside).
+data_root:   /home/s436864/data/BHAC_output/orszagTang/converge/datagen
+output_root: /home/s436864/data/FNO_output/final
