@@ -6,9 +6,12 @@ For each of the 6 run pairs, two figures are produced, each showing train and
 valid curves of BOTH variants (4 curves; BLUE = PDE parent, RED = noPDE
 control; solid = valid, dashed = train):
 
-  fig 1 — the family's "data the loss did NOT see" metric:
-            coarse8 runs -> loss_data_highres  (full-res on penalized steps)
-            stride8 runs -> loss_data_skipped  (full-res on withheld steps)
+  fig 1 — the family's per-timestep full-res metric:
+            coarse8 runs -> loss_data_highres  (full-res on non-skipped steps;
+                            coarse8 has data_loss_stride=1, so this covers every
+                            timestep and equals loss_data_full)
+            stride8 runs -> loss_data_skipped  (full-res on withheld steps —
+                            data the loss did NOT see)
   fig 2 — loss_data_full (full resolution, ALL timesteps; the one data metric
           that is directly comparable across coarse/stride configs)
 
@@ -28,7 +31,7 @@ noPDE control is shorter and its curves simply stop where they end.
 
 On top of the per-pair figures, the *_zusatz runs are overlaid on their
 non-zusatz partners (the enlarged 38-sim dataset vs. the 23-sim original), two
-figures per family (coarse8, stride8): the family's withheld-data metric
+figures per family (coarse8, stride8): the family's fig-1 metric
 (loss_data_highres coarse8 / loss_data_skipped stride8) and loss_data_full.
 Here the x-axis is "samples seen" (epoch x num_train, i.e. batches, since
 batch_size=1) rather than epoch, so the 38-sim and 23-sim runs are directly
@@ -107,7 +110,9 @@ ZUSATZ_PAIRS = [
 Y_LABELS = {
     "loss_data_full": "Loss on full res. data",
     "loss_data_skipped": "Loss at locations without Data-Supervision",
-    "loss_data_highres": "Loss at locations without Data-Supervision",
+    # coarse8 has data_loss_stride=1, so loss_data_highres spans all timesteps
+    # at full resolution — the same quantity as loss_data_full.
+    "loss_data_highres": "Loss on full res. data",
 }
 
 NAMESPACES = ("train", "valid")

@@ -244,7 +244,9 @@ class LossMHD_PhysicsNeMo(object):
             # the enforced data loss is spatially coarsened. This mirrors
             # loss_data_skipped but on the complementary time indices, and
             # together with loss_data_skipped covers the full time axis at
-            # native spatial resolution.
+            # native spatial resolution. Note that at data_loss_stride=1 (all
+            # coarse8 runs) there are no skipped steps, so this covers every
+            # timestep and coincides with loss_data_full.
             if self.data_loss_coarse_factor > 1:
                 non_skipped_idx = list(range(0, pred.shape[1], self.data_loss_stride))
                 loss_dict["loss_data_highres"] = self._data_loss_full_on(

@@ -12,10 +12,12 @@ from the wandb API — see each script's docstring.
 vs. its `*_noPDE` control (same setup, physics never switched on), it fetches
 the train/valid loss curves from the wandb API and writes two figures per
 pair into `figs/noPDE_comparison/`, named
-`<parent>__<metric>__PDE_vs_noPDE.png`: the family's withheld-data metric
-(`loss_data_highres` coarse8 / `loss_data_skipped` stride8) and the
+`<parent>__<metric>__PDE_vs_noPDE.png`: the family's per-timestep full-res
+metric (`loss_data_highres` coarse8 / `loss_data_skipped` stride8) and the
 cross-config-comparable `loss_data_full`. Blue = PDE run, red = noPDE
-control; dashed = train, solid = valid.
+control; dashed = train, solid = valid. (coarse8 runs have
+`data_loss_stride: 1`, so their `loss_data_highres` covers every timestep and
+is the same quantity as `loss_data_full` — the two coarse8 figures coincide.)
 
 Needs internet + `wandb login` (e.g. HPC login node):
 
@@ -27,7 +29,7 @@ The x-axis runs to the end of each PDE run (the noPDE control is shorter and
 just stops where it ends).
 
 It also writes into `figs/zusatz_comparison/` two figures per family (`coarse8`
-/ `stride8`) — the family's withheld-data metric and `loss_data_full` —
+/ `stride8`) — the family's per-timestep full-res metric and `loss_data_full` —
 overlaying each `*_zusatz` run (38-sim dataset) on its non-zusatz partner
 (23-sim). Their x-axis is "samples seen" (`epoch x num_train`, i.e. batches,
 since `batch_size=1`) so the two are comparable despite the zusatz run seeing
